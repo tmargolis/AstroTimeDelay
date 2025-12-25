@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:gravity="center"
+    android:background="#000000"
+    android:padding="32dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Astro Android"
+        android:textColor="#FFFFFF"
+        android:textSize="32sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="48dp" />
+
+    <Button
+        android:id="@+id/moonButton"
+        android:layout_width="280dp"
+        android:layout_height="80dp"
+        android:text="MOON\n1.3 seconds"
+        android:textSize="18sp"
+        android:layout_marginBottom="24dp"
+        android:backgroundTint="#C0C0C0" />  <!-- Change to gray/silver for moon -->
+
+    <Button
+        android:id="@+id/sunButton"
+        android:layout_width="280dp"
+        android:layout_height="80dp"
+        android:text="SUN\n8 min 20 sec"
+        android:textSize="18sp"
+        android:layout_marginBottom="24dp"
+        android:backgroundTint="#FFD54F" />  <!-- Bright sunny yellow -->
+
+    <Button
+        android:id="@+id/saturnButton"
+        android:layout_width="280dp"
+        android:layout_height="80dp"
+        android:text="SATURN\n75 minutes"
+        android:textSize="18sp"
+        android:backgroundTint="#D2691E" />  <!-- Reddish-golden -->
+
+</LinearLayout>
