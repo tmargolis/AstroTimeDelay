@@ -1,85 +1,185 @@
 package com.toddmargolis.astroandroidapp;
 
+import android.content.ContentValues;
 import android.content.Context;
 import android.graphics.Bitmap;
-import android.graphics.ImageFormat;
-import android.graphics.Rect;
-import android.graphics.YuvImage;
+import android.graphics.BitmapFactory;
 import android.media.Image;
+import android.net.Uri;
+import android.provider.MediaStore;
 import android.util.Log;
 import androidx.camera.core.ImageProxy;
-import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.ByteBuffer;
+import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
-import java.util.Queue;
-import android.content.Context;
+import java.util.Date;
+import java.util.Locale;
 
 public class FrameBuffer {
     private static final String TAG = "FrameBuffer";
+    private static final int JPEG_QUALITY = 60;
 
-    private Context context;
+    private final CelestialMode mode;
+    private final Context context;
 
-    private CelestialMode mode;
-    private Queue<Bitmap> bitmapBuffer;
+    // RAM path (Moon)
+    private ArrayDeque<Bitmap> bitmapBuffer;
+    private ArrayDeque<Long> timestampBuffer;
+
+    // Disk path (Sun, Saturn) — stored via MediaStore in Pictures/AstroTimeDelay/
+    private ArrayDeque<Uri> uriBuffer;
+    private ArrayDeque<Long> diskTimestampBuffer;
+    private String sessionRelativePath;
+
+    private static final SimpleDateFormat FOLDER_FMT =
+            new SimpleDateFormat("yyyy-MM-dd:HH:mm:ss", Locale.US);
+    private static final SimpleDateFormat FILE_FMT =
+            new SimpleDateFormat("yyyy.MM.dd.HH.mm.ss.SSS", Locale.US);
+
     private int maxFrames;
+    private int frameSkip;      // store 1 out of every N incoming frames
+    private int skipCounter = 0;
     private long frameCount = 0;
+    private long firstFrameTimeMs = 0;
 
     public FrameBuffer(Context context, CelestialMode mode) {
-        this.context = context;  // Add this line
+        this.context = context;
         this.mode = mode;
+        this.frameSkip = Math.max(1, mode.targetFps / mode.bufferFps);
+        this.maxFrames = (int)(mode.delaySeconds * mode.bufferFps) + 1;
 
-        // For now, we'll use uncompressed for all modes to keep it simple
-        // Calculate max frames needed for delay
-        maxFrames = (int)(mode.delaySeconds * mode.targetFps) + 10; // +10 buffer
-        bitmapBuffer = new ArrayDeque<>();
+        if (mode.useCompression) {
+            String startTime = FOLDER_FMT.format(new Date());
+            sessionRelativePath = "Pictures/AstroTimeDelay/" + mode.name + "_" + startTime + "/";
+            uriBuffer = new ArrayDeque<>();
+            diskTimestampBuffer = new ArrayDeque<>();
+        } else {
+            bitmapBuffer = new ArrayDeque<>();
+            timestampBuffer = new ArrayDeque<>();
+        }
 
-        Log.d(TAG, "FrameBuffer initialized for " + mode.name +
-                " with max " + maxFrames + " frames");
+        Log.d(TAG, "FrameBuffer init: " + mode.name +
+                " maxFrames=" + maxFrames +
+                " frameSkip=" + frameSkip +
+                " disk=" + mode.useCompression +
+                (mode.useCompression ? " path=" + sessionRelativePath : ""));
     }
+
+    public long getFirstFrameTimeMs() { return firstFrameTimeMs; }
 
     public void addFrame(ImageProxy imageProxy) {
         try {
-            // Convert ImageProxy to Bitmap
+            skipCounter++;
+            if (skipCounter < frameSkip) {
+                return;
+            }
+            skipCounter = 0;
+
             Bitmap bitmap = imageProxyToBitmap(imageProxy);
+            if (bitmap == null) return;
 
-            if (bitmap != null) {
+            frameCount++;
+            if (frameCount == 1) firstFrameTimeMs = System.currentTimeMillis();
+
+            if (mode.useCompression) {
+                addFrameToDisk(bitmap);
+                bitmap.recycle();
+            } else {
                 bitmapBuffer.add(bitmap);
-                frameCount++;
-
-                // Remove old frames if buffer is full
+                timestampBuffer.add(System.currentTimeMillis());
                 while (bitmapBuffer.size() > maxFrames) {
                     Bitmap old = bitmapBuffer.poll();
-                    if (old != null && !old.isRecycled()) {
-                        old.recycle();
-                    }
+                    if (old != null && !old.isRecycled()) old.recycle();
+                    timestampBuffer.poll();
                 }
+            }
 
-                if (frameCount % 30 == 0) {
-                    Log.d(TAG, "Buffer size: " + bitmapBuffer.size() + " frames");
-                }
+            if (frameCount % 30 == 0) {
+                int size = mode.useCompression ? uriBuffer.size() : bitmapBuffer.size();
+                Log.d(TAG, "Buffer: " + size + " frames");
             }
         } catch (Exception e) {
             Log.e(TAG, "Error adding frame", e);
         }
     }
 
-    public Bitmap getDelayedFrame() {
-        // Return the oldest frame (head of queue)
-        // Don't remove it - we keep it in the buffer
-        if (bitmapBuffer.isEmpty()) {
-            return null;
+    private void addFrameToDisk(Bitmap bitmap) {
+        try {
+            long captureTimeMs = System.currentTimeMillis();
+            String filename = FILE_FMT.format(new Date(captureTimeMs)) + ".jpg";
+
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.Images.Media.DISPLAY_NAME, filename);
+            values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+            values.put(MediaStore.Images.Media.RELATIVE_PATH, sessionRelativePath);
+
+            Uri uri = context.getContentResolver().insert(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+            if (uri == null) {
+                Log.e(TAG, "MediaStore insert returned null URI");
+                return;
+            }
+
+            try (OutputStream out = context.getContentResolver().openOutputStream(uri)) {
+                if (out != null) {
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out);
+                }
+            }
+
+            uriBuffer.add(uri);
+            diskTimestampBuffer.add(captureTimeMs);
+
+            while (uriBuffer.size() > maxFrames) {
+                Uri old = uriBuffer.poll();
+                if (old != null) context.getContentResolver().delete(old, null, null);
+                diskTimestampBuffer.poll();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error writing frame to MediaStore", e);
         }
-        return bitmapBuffer.peek();
+    }
+
+    public Bitmap getDelayedFrame() {
+        if (mode.useCompression) {
+            Uri uri = uriBuffer.peek();
+            if (uri == null) return null;
+            try (InputStream in = context.getContentResolver().openInputStream(uri)) {
+                if (in == null) return null;
+                return BitmapFactory.decodeStream(in);
+            } catch (Exception e) {
+                Log.e(TAG, "Error reading frame from MediaStore", e);
+                return null;
+            }
+        } else {
+            if (bitmapBuffer.isEmpty()) return null;
+            return bitmapBuffer.peek();
+        }
+    }
+
+    /**
+     * Returns the capture timestamp (ms since epoch) of the frame currently
+     * at the head of the buffer — i.e. the frame being shown on screen.
+     * For disk modes (Sun/Saturn): from diskTimestampBuffer (recorded at write time).
+     * For RAM mode (Moon): from timestampBuffer (recorded at add time).
+     * Returns 0 if no frame is available yet.
+     */
+    public long getCurrentFrameTimestamp() {
+        if (mode.useCompression) {
+            Long ts = diskTimestampBuffer.peek();
+            return ts != null ? ts : 0;
+        } else {
+            Long ts = timestampBuffer.peek();
+            return ts != null ? ts : 0;
+        }
     }
 
     private Bitmap imageProxyToBitmap(ImageProxy imageProxy) {
         try {
             Image image = imageProxy.getImage();
-            if (image == null) {
-                return null;
-            }
+            if (image == null) return null;
 
-            // With RGBA format, conversion is straightforward
             Image.Plane[] planes = image.getPlanes();
             ByteBuffer buffer = planes[0].getBuffer();
             int pixelStride = planes[0].getPixelStride();
@@ -92,27 +192,33 @@ public class FrameBuffer {
                     Bitmap.Config.ARGB_8888);
             bitmap.copyPixelsFromBuffer(buffer);
 
-            // Crop if there's padding
             if (rowPadding != 0) {
-                bitmap = Bitmap.createBitmap(bitmap, 0, 0, image.getWidth(), image.getHeight());
+                Bitmap cropped = Bitmap.createBitmap(bitmap, 0, 0,
+                        image.getWidth(), image.getHeight());
+                bitmap.recycle();
+                return cropped;
             }
-
             return bitmap;
-
         } catch (Exception e) {
-            Log.e(TAG, "Error converting RGBA image", e);
+            Log.e(TAG, "Error converting frame", e);
             return null;
         }
     }
 
     public void release() {
-        // Clean up all bitmaps
-        for (Bitmap bitmap : bitmapBuffer) {
-            if (bitmap != null && !bitmap.isRecycled()) {
-                bitmap.recycle();
+        if (mode.useCompression) {
+            for (Uri uri : uriBuffer) {
+                if (uri != null) context.getContentResolver().delete(uri, null, null);
             }
+            uriBuffer.clear();
+            diskTimestampBuffer.clear();
+        } else {
+            for (Bitmap b : bitmapBuffer) {
+                if (b != null && !b.isRecycled()) b.recycle();
+            }
+            bitmapBuffer.clear();
+            timestampBuffer.clear();
         }
-        bitmapBuffer.clear();
         Log.d(TAG, "FrameBuffer released");
     }
 }

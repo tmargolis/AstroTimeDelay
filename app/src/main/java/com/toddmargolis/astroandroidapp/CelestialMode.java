@@ -7,12 +7,13 @@ public class CelestialMode {
     public int targetWidth;
     public int targetHeight;
     public int targetFps;
+    public int bufferFps;
     public int tintColor;
     public boolean useAutoTint;
     public boolean useCompression;
 
     public CelestialMode(String name, float delaySeconds, int overlayResourceId,
-                         int targetWidth, int targetHeight, int targetFps,
+                         int targetWidth, int targetHeight, int targetFps, int bufferFps,
                          int tintColor, boolean useAutoTint, boolean useCompression) {
         this.name = name;
         this.delaySeconds = delaySeconds;
@@ -20,6 +21,7 @@ public class CelestialMode {
         this.targetWidth = targetWidth;
         this.targetHeight = targetHeight;
         this.targetFps = targetFps;
+        this.bufferFps = bufferFps;
         this.tintColor = tintColor;
         this.useAutoTint = useAutoTint;
         this.useCompression = useCompression;
@@ -30,35 +32,35 @@ public class CelestialMode {
         return new CelestialMode(
                 "Moon",
                 1.3f,
-                R.drawable.moon_overlay,  // We'll add this image later
-                1920, 1080, 30,
-                0xFFFFFFFF,  // White (will be auto-calculated)
-                true,   // Use auto tint
-                false   // No compression for Moon
+                R.drawable.moon_overlay,
+                1920, 1080, 30, 30,
+                0xFFFFFFFF,
+                true,
+                false
         );
     }
 
     public static CelestialMode createSunMode() {
         return new CelestialMode(
                 "Sun",
-                500f,  // 8 min 20 sec = 500 seconds
+                500f,
                 R.drawable.sun_overlay,
-                1920, 1080, 30,
-                0xFFFFD54F,  // Orange - you can change this
-                false,  // Manual tint color
-                true    // Use compression
+                1920, 1080, 30, 15,
+                0xFFFFD54F,
+                false,
+                true
         );
     }
 
     public static CelestialMode createSaturnMode() {
         return new CelestialMode(
                 "Saturn",
-                4500f,  // 75 minutes = 4500 seconds
+                4740f,
                 R.drawable.saturn_placeholder,
-                1280, 720, 24,  // Lower res/fps for Saturn
-                0xFFD2691E,  // Goldenrod - placeholder
-                false,   // Manual tint color
-                true    // Use compression
+                1280, 720, 24, 1,
+                0xFFD2691E,
+                false,
+                true
         );
     }
 }

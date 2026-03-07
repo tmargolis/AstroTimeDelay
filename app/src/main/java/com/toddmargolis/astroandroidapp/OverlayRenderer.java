@@ -23,11 +23,15 @@ public class OverlayRenderer {
 
 
     public OverlayRenderer(Context context, CelestialMode mode) {
-        this.mode = mode;  // Add this line
+        this.mode = mode;
 
-        // Load overlay image
+        // Load overlay image.
+        // Saturn: disable density scaling so it loads at exact pixel dimensions (512x512).
+        // Sun/Moon: allow normal density scaling (images are then manually scaled to fit the frame).
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inScaled = !mode.name.equals("Saturn");
         overlayImage = BitmapFactory.decodeResource(context.getResources(),
-                mode.overlayResourceId);
+                mode.overlayResourceId, opts);
 
         // Setup tint color
         if (mode.useAutoTint) {
@@ -46,7 +50,10 @@ public class OverlayRenderer {
         tintPaint.setColorFilter(colorFilter);
 
         overlayPaint = new Paint();
-        overlayPaint.setAlpha(250); // 50% transparency (0-255)
+        overlayPaint.setAntiAlias(true);
+        overlayPaint.setFilterBitmap(true);
+        overlayPaint.setDither(true);
+        // Removed hardcoded alpha to keep PNG transparency
     }
 
     public Bitmap renderFrame(Bitmap videoFrame, float overlayAlpha) {
@@ -64,47 +71,46 @@ public class OverlayRenderer {
             // 1. Draw delayed video with tint
             canvas.drawBitmap(videoFrame, 0, 0, tintPaint);
 
-            // 2. Draw overlay image on top (scaled to fit)
+            // 2. Draw overlay image on top
             if (overlayImage != null) {
-                // Center overlay without stretching
-                float scale = Math.min(
-                        (float)videoFrame.getWidth() / overlayImage.getWidth(),
-                        (float)videoFrame.getHeight() / overlayImage.getHeight()
-                );
+                final Bitmap overlayToDraw;
+                final int left;
+                final int top;
 
-                // Scale Moon by 2x
-                if (mode.name.equals("Moon")) {
-                    scale *= 0.5f;
-                }
-
-                int scaledWidth = (int)(overlayImage.getWidth() * scale);
-                int scaledHeight = (int)(overlayImage.getHeight() * scale);
-
-                Bitmap scaledOverlay = Bitmap.createScaledBitmap(overlayImage,
-                        scaledWidth,
-                        scaledHeight,
-                        true);
-
-
-                // Center horizontally
-                int left = (videoFrame.getWidth() - scaledWidth) / 2;
-
-                // Anchor to bottom for Sun, center for others
-                int top;
-                if (mode.name.equals("Sun")) {
-                    int offset = (int)(videoFrame.getHeight() * 0.1);  // 10% of height
-                    top = videoFrame.getHeight() - scaledHeight - offset;  // Bottom
+                if (mode.name.equals("Saturn")) {
+                    // Draw at native size, top-left corner — no scaling
+                    overlayToDraw = overlayImage;
+                    left = 0;
+                    top = 0;
                 } else {
-                    top = (videoFrame.getHeight() - scaledHeight) / 2;  // Center
+                    // Scale to fit frame
+                    float scale = Math.min(
+                            (float)videoFrame.getWidth() / overlayImage.getWidth(),
+                            (float)videoFrame.getHeight() / overlayImage.getHeight()
+                    );
+                    if (mode.name.equals("Moon")) {
+                        scale *= 0.5f;
+                    }
+                    int scaledWidth = (int)(overlayImage.getWidth() * scale);
+                    int scaledHeight = (int)(overlayImage.getHeight() * scale);
+                    overlayToDraw = Bitmap.createScaledBitmap(overlayImage,
+                            scaledWidth, scaledHeight, true);
+
+                    if (mode.name.equals("Sun")) {
+                        left = (videoFrame.getWidth() - scaledWidth) / 2;
+                        int offset = (int)(videoFrame.getHeight() * 0.1);
+                        top = videoFrame.getHeight() - scaledHeight - offset;
+                    } else {
+                        left = (videoFrame.getWidth() - scaledWidth) / 2;
+                        top = (videoFrame.getHeight() - scaledHeight) / 2;
+                    }
                 }
 
-                canvas.drawBitmap(scaledOverlay, left, top, overlayPaint);
+                overlayPaint.setAlpha((int)(255 * overlayAlpha));
+                canvas.drawBitmap(overlayToDraw, left, top, overlayPaint);
 
-                // Set alpha
-                //overlayPaint.setAlpha((int)(255 * overlayAlpha));
-
-                if (scaledOverlay != overlayImage) {
-                    scaledOverlay.recycle();
+                if (overlayToDraw != overlayImage) {
+                    overlayToDraw.recycle();
                 }
             }
 

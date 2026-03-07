@@ -40,7 +40,7 @@ AstroTimeDelay is an astronomy observation app that overlays celestial body imag
 |------|-------|------------|------------------|
 | Moon | 1.3s | 1920x1080 | Centered |
 | Sun | 8m 20s | 1920x1080 | Bottom |
-| Saturn | 75m | 1280x720 | Centered |
+| Saturn | 79m | 1280x720 | Centered |
 
 ## Project Structure
 
