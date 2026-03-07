@@ -98,8 +98,7 @@ public class OverlayRenderer {
 
                     if (mode.name.equals("Sun")) {
                         left = (videoFrame.getWidth() - scaledWidth) / 2;
-                        int offset = (int)(videoFrame.getHeight() * 0.1);
-                        top = videoFrame.getHeight() - scaledHeight - offset;
+                        top = 0; // aligned to top edge
                     } else {
                         left = (videoFrame.getWidth() - scaledWidth) / 2;
                         top = (videoFrame.getHeight() - scaledHeight) / 2;
