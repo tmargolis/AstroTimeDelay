@@ -12,6 +12,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.util.Log;
+import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -41,6 +42,7 @@ public class CameraActivity extends AppCompatActivity {
     private ExecutorService cameraExecutor;
     private ProcessCameraProvider cameraProvider;
     private TextView modeIndicator;
+    private TextView modeNameLabel;
     private TextView queuingLabel;
     private Bitmap lastDelayedFrame = null; // skip re-render when frame hasn't changed
 
@@ -51,7 +53,11 @@ public class CameraActivity extends AppCompatActivity {
     private Paint emaFadePaint;
     private Paint emaAddPaint;
     private int miniW, miniH;
+    private int margin16dp; // dp→px conversion cached for layout phase transitions
+    private boolean isPlaybackPhase = false; // tracks QUEUEING vs delay-playback phase
     private boolean stackInitialized = false; // seed first frame at full opacity
+    private int emaUpdateEvery = 1;  // batch K stored frames per EMA update (for tiny-α modes)
+    private int emaFrameCounter = 0;
 
     private long startTimeMs;
     private final Handler timerHandler = new Handler(Looper.getMainLooper());
@@ -77,6 +83,7 @@ public class CameraActivity extends AppCompatActivity {
         displayView = findViewById(R.id.displayView);
         modeLabel = findViewById(R.id.modeLabel);
         modeIndicator = findViewById(R.id.modeIndicator);
+        modeNameLabel = findViewById(R.id.modeNameLabel);
         queuingLabel = findViewById(R.id.queuingLabel);
 
 
@@ -106,51 +113,60 @@ public class CameraActivity extends AppCompatActivity {
         getWindowManager().getDefaultDisplay().getMetrics(dm);
         miniW = dm.widthPixels / 4;
         miniH = miniW * 9 / 16;
+        margin16dp = (int)(16 * dm.density);
 
         // Initialize components (pass thumb dimensions to FrameBuffer)
         frameBuffer = new FrameBuffer(this, mode, miniW, miniH);
         renderer = new OverlayRenderer(this, mode);
 
-        // Set up stackView dimensions programmatically
         stackView = findViewById(R.id.stackView);
-        ViewGroup.LayoutParams lp = stackView.getLayoutParams();
-        lp.width = miniW;
-        lp.height = miniH;
-        stackView.setLayoutParams(lp);
 
-        // Adjust modeIndicator bottom margin to sit above the stack view.
-        // stackView sits with 16dp bottom margin; add miniH + 16dp + small gap.
-        int margin16dp = (int)(16 * dm.density);
-        FrameLayout.LayoutParams indLp = (FrameLayout.LayoutParams) modeIndicator.getLayoutParams();
-        indLp.bottomMargin = miniH + margin16dp + margin16dp; // miniH + 16dp (stack margin) + 16dp (gap)
-        modeIndicator.setLayoutParams(indLp);
+        // Set mode name label text
+        String nameText;
+        switch (mode.name) {
+            case "Sun":    nameText = "Sun / 8 minute 20 second delay"; break;
+            case "Saturn": nameText = "Saturn / 90 minute delay";       break;
+            default:       nameText = "Moon / 1.3 sec delay";           break;
+        }
+        modeNameLabel.setText(nameText);
 
         // Initialize EMA double-buffer (both bitmaps start black/transparent)
         stackSrc = Bitmap.createBitmap(miniW, miniH, Bitmap.Config.ARGB_8888);
         stackDst = Bitmap.createBitmap(miniW, miniH, Bitmap.Config.ARGB_8888);
         stackCanvas = new Canvas(stackDst);
 
-        // Configure EMA paints using α from FrameBuffer
+        // Configure EMA paints using α from FrameBuffer.
+        // For Sun/Saturn, per-frame α is so tiny that (int)(α*255) == 0 — nothing gets blended.
+        // Fix: batch K stored frames per EMA update, using effective α = K*α, where K is chosen
+        // so that (int)(K*α*255) >= 1. Fade per update is then (1-α)^K ≈ 1-K*α.
         float emaAlpha = frameBuffer.getEmaAlpha();
+        emaUpdateEvery = Math.max(1, (int)Math.ceil(1.0 / (emaAlpha * 255)));
+        float effectiveAlpha = emaUpdateEvery * emaAlpha;
 
-        // EMA fade paint: scale RGB channels by (1-α), leave alpha untouched
+        // EMA fade paint: scale RGB channels by (1-α)^K, leave alpha untouched
         emaFadePaint = new Paint();
         emaFadePaint.setAntiAlias(false);
         emaFadePaint.setFilterBitmap(false);
-        float fadeScale = 1.0f - emaAlpha;
+        float fadeScale = (float)Math.pow(1.0 - emaAlpha, emaUpdateEvery);
         ColorMatrix cm = new ColorMatrix();
         cm.setScale(fadeScale, fadeScale, fadeScale, 1.0f);
         emaFadePaint.setColorFilter(new ColorMatrixColorFilter(cm));
 
-        // EMA add paint: additive blend at α opacity
+        // EMA add paint: additive blend at effective α opacity (guaranteed >= 1/255)
         emaAddPaint = new Paint();
         emaAddPaint.setAntiAlias(false);
         emaAddPaint.setFilterBitmap(false);
-        emaAddPaint.setAlpha((int)(emaAlpha * 255));
+        emaAddPaint.setAlpha((int)(effectiveAlpha * 255));
         emaAddPaint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.ADD));
 
         Log.d(TAG, "EMA mini-view: " + miniW + "x" + miniH +
-                " alpha=" + emaAlpha + " maxFrames=" + (int)(Math.log(100.0) / emaAlpha));
+                " perFrameAlpha=" + emaAlpha +
+                " batchK=" + emaUpdateEvery +
+                " effectiveAlpha=" + effectiveAlpha +
+                " addPaintAlpha=" + (int)(effectiveAlpha * 255));
+
+        // Start in QUEUEING layout (fullscreen ghost, countdown at bottom right)
+        updateLayoutForPhase(false);
 
         // Start timer label
         startTimeMs = System.currentTimeMillis();
@@ -163,24 +179,26 @@ public class CameraActivity extends AppCompatActivity {
 
     private void updateTimeLabel() {
         long firstFrameMs = frameBuffer.getFirstFrameTimeMs();
-        if (firstFrameMs == 0) {
-            // Camera not started yet — show full delay as initial countdown with QUEUEING banner
-            modeIndicator.setText(formatCountdown((int) mode.delaySeconds));
-            queuingLabel.setVisibility(View.VISIBLE);
-            return;
+        float elapsedSecs = (firstFrameMs == 0) ? 0 :
+                (System.currentTimeMillis() - firstFrameMs) / 1000f;
+        boolean nowPlayback = (firstFrameMs != 0 && elapsedSecs >= mode.delaySeconds);
+
+        // Trigger layout switch on phase transition
+        if (nowPlayback != isPlaybackPhase) {
+            isPlaybackPhase = nowPlayback;
+            updateLayoutForPhase(isPlaybackPhase);
         }
 
-        float elapsedSecs = (System.currentTimeMillis() - firstFrameMs) / 1000f;
-
-        if (elapsedSecs < mode.delaySeconds) {
+        if (!nowPlayback) {
             // Countdown phase: show time remaining and QUEUEING banner
-            int remaining = (int)(mode.delaySeconds - elapsedSecs);
+            int remaining = (firstFrameMs == 0)
+                    ? (int) mode.delaySeconds
+                    : (int)(mode.delaySeconds - elapsedSecs);
             modeIndicator.setText(formatCountdown(remaining));
             queuingLabel.setVisibility(View.VISIBLE);
         } else {
             // Playback phase: hide QUEUEING banner, show exact capture time
             queuingLabel.setVisibility(View.GONE);
-            // Show the exact capture time of the frame currently on screen
             long frameTimeMs = frameBuffer.getCurrentFrameTimestamp();
             if (frameTimeMs > 0) {
                 Calendar cal = Calendar.getInstance();
@@ -196,6 +214,37 @@ public class CameraActivity extends AppCompatActivity {
                         "%02d/%02d/%04d %02d:%02d:%02d.%03d",
                         month, day, year, h, m, s, ms));
             }
+        }
+    }
+
+    private void updateLayoutForPhase(boolean playback) {
+        if (playback) {
+            // Delay mode: ghost stack shrinks to mini bottom-right corner, flush to edge
+            FrameLayout.LayoutParams stackLp =
+                    new FrameLayout.LayoutParams(miniW, miniH);
+            stackLp.gravity = Gravity.BOTTOM | Gravity.END;
+            stackLp.setMargins(0, 0, 0, 0);
+            stackView.setLayoutParams(stackLp);
+
+            // Timestamp sits directly above the mini ghost view (no gap)
+            FrameLayout.LayoutParams indLp =
+                    (FrameLayout.LayoutParams) modeIndicator.getLayoutParams();
+            indLp.bottomMargin = miniH;
+            modeIndicator.setLayoutParams(indLp);
+        } else {
+            // Queueing mode: ghost stack expands to fullscreen
+            FrameLayout.LayoutParams stackLp = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT);
+            stackLp.gravity = Gravity.CENTER;
+            stackLp.setMargins(0, 0, 0, 0);
+            stackView.setLayoutParams(stackLp);
+
+            // Countdown at very bottom right, flush to edge
+            FrameLayout.LayoutParams indLp =
+                    (FrameLayout.LayoutParams) modeIndicator.getLayoutParams();
+            indLp.bottomMargin = 0;
+            modeIndicator.setLayoutParams(indLp);
         }
     }
 
@@ -249,30 +298,35 @@ public class CameraActivity extends AppCompatActivity {
 
                 // EMA mini-view update: only when a new frame was actually stored
                 if (thumb != null) {
+                    emaFrameCounter++;
                     if (!stackInitialized) {
                         // Seed both buffers with the first frame at full opacity so the
                         // mini-view is immediately visible even for modes with tiny α (Sun, Saturn)
                         Paint fullPaint = new Paint();
                         stackCanvas.drawBitmap(thumb, 0, 0, fullPaint);
-                        // Also seed stackSrc so the first EMA step has a valid base
                         Canvas srcCanvas = new Canvas(stackSrc);
                         srcCanvas.drawBitmap(thumb, 0, 0, fullPaint);
                         stackInitialized = true;
-                    } else {
-                        // Pass 1: fade old composite by (1-α)
+                        emaFrameCounter = 0;
+
+                        final Bitmap posted = stackDst;
+                        runOnUiThread(() -> stackView.setImageBitmap(posted));
+                        Bitmap tmp = stackSrc; stackSrc = stackDst; stackDst = tmp;
+                        stackCanvas.setBitmap(stackDst);
+                    } else if (emaFrameCounter >= emaUpdateEvery) {
+                        // Batch K stored frames reached — do one EMA update
+                        emaFrameCounter = 0;
+                        // Pass 1: fade old composite by (1-α)^K
                         stackCanvas.drawBitmap(stackSrc, 0, 0, emaFadePaint);
-                        // Pass 2: add new frame at α opacity
+                        // Pass 2: add latest frame at effective α = K*α
                         stackCanvas.drawBitmap(thumb, 0, 0, emaAddPaint);
+
+                        final Bitmap posted = stackDst;
+                        runOnUiThread(() -> stackView.setImageBitmap(posted));
+                        Bitmap tmp = stackSrc; stackSrc = stackDst; stackDst = tmp;
+                        stackCanvas.setBitmap(stackDst);
                     }
                     thumb.recycle();
-
-                    // Post current dst to UI, then swap src/dst
-                    final Bitmap posted = stackDst;
-                    runOnUiThread(() -> stackView.setImageBitmap(posted));
-                    Bitmap tmp = stackSrc;
-                    stackSrc = stackDst;
-                    stackDst = tmp;
-                    stackCanvas.setBitmap(stackDst);
                 }
 
                 // Get delayed frame and render — only re-composite when the frame

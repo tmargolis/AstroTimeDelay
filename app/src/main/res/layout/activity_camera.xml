@@ -24,7 +24,17 @@
         android:padding="12dp"
         android:background="#80000000" />
 
-    <!-- Large centered label shown while buffer is filling -->
+    <!-- EMA ghost-stack mini-view (layout set programmatically; placed here so queuingLabel renders on top) -->
+    <ImageView
+        android:id="@+id/stackView"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_gravity="bottom|end"
+        android:layout_margin="16dp"
+        android:scaleType="fitXY"
+        android:background="#000000" />
+
+    <!-- Large centered label shown while buffer is filling (on top of stackView) -->
     <TextView
         android:id="@+id/queuingLabel"
         android:layout_width="wrap_content"
@@ -37,15 +47,19 @@
         android:alpha="0.7"
         android:visibility="gone" />
 
-    <!-- EMA ghost-stack mini-view (sized programmatically in CameraActivity) -->
-    <ImageView
-        android:id="@+id/stackView"
-        android:layout_width="0dp"
-        android:layout_height="0dp"
-        android:layout_gravity="bottom|end"
-        android:layout_margin="16dp"
-        android:scaleType="fitXY"
-        android:background="#000000" />
+    <!-- Mode name + delay label, very bottom left -->
+    <TextView
+        android:id="@+id/modeNameLabel"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|start"
+        android:layout_marginStart="16dp"
+        android:layout_marginBottom="0dp"
+        android:text=""
+        android:textColor="#FFFFFF"
+        android:textSize="12sp"
+        android:padding="8dp"
+        android:background="#80000000" />
 
     <!-- Mode indicator label in bottom right (bottom margin adjusted in code to sit above stackView) -->
     <TextView
@@ -53,7 +67,7 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="bottom|end"
-        android:layout_margin="16dp"
+        android:layout_marginEnd="16dp"
         android:text="Moon"
         android:textColor="#FFFFFF"
         android:textSize="12sp"
