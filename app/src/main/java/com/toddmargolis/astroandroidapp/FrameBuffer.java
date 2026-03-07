@@ -24,6 +24,11 @@ public class FrameBuffer {
     private final CelestialMode mode;
     private final Context context;
 
+    // Thumbnail dimensions for the EMA mini-view
+    private final int thumbW;
+    private final int thumbH;
+    private final float emaAlpha; // α = ln(100) / maxFrames
+
     // RAM path (Moon)
     private ArrayDeque<Bitmap> bitmapBuffer;
     private ArrayDeque<Long> timestampBuffer;
@@ -32,6 +37,9 @@ public class FrameBuffer {
     private ArrayDeque<Uri> uriBuffer;
     private ArrayDeque<Long> diskTimestampBuffer;
     private String sessionRelativePath;
+    // Cache the last decoded frame so we only hit MediaStore when the buffer head actually advances
+    private Bitmap cachedFrame;
+    private Uri cachedUri;
 
     private static final SimpleDateFormat FOLDER_FMT =
             new SimpleDateFormat("yyyy-MM-dd:HH:mm:ss", Locale.US);
@@ -44,11 +52,14 @@ public class FrameBuffer {
     private long frameCount = 0;
     private long firstFrameTimeMs = 0;
 
-    public FrameBuffer(Context context, CelestialMode mode) {
+    public FrameBuffer(Context context, CelestialMode mode, int thumbW, int thumbH) {
         this.context = context;
         this.mode = mode;
+        this.thumbW = thumbW;
+        this.thumbH = thumbH;
         this.frameSkip = Math.max(1, mode.targetFps / mode.bufferFps);
         this.maxFrames = (int)(mode.delaySeconds * mode.bufferFps) + 1;
+        this.emaAlpha = (float)(Math.log(100.0) / maxFrames);
 
         if (mode.useCompression) {
             String startTime = FOLDER_FMT.format(new Date());
@@ -69,19 +80,29 @@ public class FrameBuffer {
 
     public long getFirstFrameTimeMs() { return firstFrameTimeMs; }
 
-    public void addFrame(ImageProxy imageProxy) {
+    public float getEmaAlpha() { return emaAlpha; }
+
+    /**
+     * Adds a frame to the buffer. Returns a thumbnail Bitmap (thumbW × thumbH) if the frame
+     * was stored, or null if it was skipped (frameSkip). Caller is responsible for recycling
+     * the returned thumbnail after use.
+     */
+    public Bitmap addFrame(ImageProxy imageProxy) {
         try {
             skipCounter++;
             if (skipCounter < frameSkip) {
-                return;
+                return null;
             }
             skipCounter = 0;
 
             Bitmap bitmap = imageProxyToBitmap(imageProxy);
-            if (bitmap == null) return;
+            if (bitmap == null) return null;
 
             frameCount++;
             if (frameCount == 1) firstFrameTimeMs = System.currentTimeMillis();
+
+            // Generate thumbnail BEFORE any recycle call
+            Bitmap thumb = Bitmap.createScaledBitmap(bitmap, thumbW, thumbH, true);
 
             if (mode.useCompression) {
                 addFrameToDisk(bitmap);
@@ -100,8 +121,11 @@ public class FrameBuffer {
                 int size = mode.useCompression ? uriBuffer.size() : bitmapBuffer.size();
                 Log.d(TAG, "Buffer: " + size + " frames");
             }
+
+            return thumb;
         } catch (Exception e) {
             Log.e(TAG, "Error adding frame", e);
+            return null;
         }
     }
 
@@ -145,12 +169,26 @@ public class FrameBuffer {
         if (mode.useCompression) {
             Uri uri = uriBuffer.peek();
             if (uri == null) return null;
+
+            // Only decode from MediaStore when the buffer head has actually advanced.
+            // Without this, every camera frame (24fps for Saturn) would decode the same
+            // JPEG from MediaStore, causing massive I/O load and eventual freeze.
+            if (uri.equals(cachedUri) && cachedFrame != null && !cachedFrame.isRecycled()) {
+                return cachedFrame;
+            }
+
             try (InputStream in = context.getContentResolver().openInputStream(uri)) {
-                if (in == null) return null;
-                return BitmapFactory.decodeStream(in);
+                if (in == null) return cachedFrame; // fall back to last good frame on I/O failure
+                Bitmap decoded = BitmapFactory.decodeStream(in);
+                if (decoded != null) {
+                    if (cachedFrame != null && !cachedFrame.isRecycled()) cachedFrame.recycle();
+                    cachedFrame = decoded;
+                    cachedUri = uri;
+                }
+                return cachedFrame;
             } catch (Exception e) {
                 Log.e(TAG, "Error reading frame from MediaStore", e);
-                return null;
+                return cachedFrame; // fall back to last good frame on error
             }
         } else {
             if (bitmapBuffer.isEmpty()) return null;
@@ -212,6 +250,9 @@ public class FrameBuffer {
             }
             uriBuffer.clear();
             diskTimestampBuffer.clear();
+            if (cachedFrame != null && !cachedFrame.isRecycled()) cachedFrame.recycle();
+            cachedFrame = null;
+            cachedUri = null;
         } else {
             for (Bitmap b : bitmapBuffer) {
                 if (b != null && !b.isRecycled()) b.recycle();

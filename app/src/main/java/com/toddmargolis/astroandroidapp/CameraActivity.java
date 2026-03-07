@@ -1,12 +1,21 @@
 package com.toddmargolis.astroandroidapp;
 
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.ColorMatrix;
+import android.graphics.ColorMatrixColorFilter;
+import android.graphics.Paint;
+import android.graphics.PorterDuff;
+import android.graphics.PorterDuffXfermode;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.TextView;
 import androidx.annotation.NonNull;
@@ -33,6 +42,16 @@ public class CameraActivity extends AppCompatActivity {
     private ProcessCameraProvider cameraProvider;
     private TextView modeIndicator;
     private TextView queuingLabel;
+    private Bitmap lastDelayedFrame = null; // skip re-render when frame hasn't changed
+
+    // EMA mini-view (ghost stack composite)
+    private ImageView stackView;
+    private Bitmap stackSrc, stackDst;
+    private Canvas stackCanvas;
+    private Paint emaFadePaint;
+    private Paint emaAddPaint;
+    private int miniW, miniH;
+    private boolean stackInitialized = false; // seed first frame at full opacity
 
     private long startTimeMs;
     private final Handler timerHandler = new Handler(Looper.getMainLooper());
@@ -82,9 +101,56 @@ public class CameraActivity extends AppCompatActivity {
         modeLabel.setVisibility(View.GONE);
         modeIndicator.setVisibility(View.VISIBLE);
 
-        // Initialize components
-        frameBuffer = new FrameBuffer(this, mode);
+        // Compute mini-view dimensions: 25% of screen width, 16:9 aspect ratio
+        DisplayMetrics dm = new DisplayMetrics();
+        getWindowManager().getDefaultDisplay().getMetrics(dm);
+        miniW = dm.widthPixels / 4;
+        miniH = miniW * 9 / 16;
+
+        // Initialize components (pass thumb dimensions to FrameBuffer)
+        frameBuffer = new FrameBuffer(this, mode, miniW, miniH);
         renderer = new OverlayRenderer(this, mode);
+
+        // Set up stackView dimensions programmatically
+        stackView = findViewById(R.id.stackView);
+        ViewGroup.LayoutParams lp = stackView.getLayoutParams();
+        lp.width = miniW;
+        lp.height = miniH;
+        stackView.setLayoutParams(lp);
+
+        // Adjust modeIndicator bottom margin to sit above the stack view.
+        // stackView sits with 16dp bottom margin; add miniH + 16dp + small gap.
+        int margin16dp = (int)(16 * dm.density);
+        FrameLayout.LayoutParams indLp = (FrameLayout.LayoutParams) modeIndicator.getLayoutParams();
+        indLp.bottomMargin = miniH + margin16dp + margin16dp; // miniH + 16dp (stack margin) + 16dp (gap)
+        modeIndicator.setLayoutParams(indLp);
+
+        // Initialize EMA double-buffer (both bitmaps start black/transparent)
+        stackSrc = Bitmap.createBitmap(miniW, miniH, Bitmap.Config.ARGB_8888);
+        stackDst = Bitmap.createBitmap(miniW, miniH, Bitmap.Config.ARGB_8888);
+        stackCanvas = new Canvas(stackDst);
+
+        // Configure EMA paints using α from FrameBuffer
+        float emaAlpha = frameBuffer.getEmaAlpha();
+
+        // EMA fade paint: scale RGB channels by (1-α), leave alpha untouched
+        emaFadePaint = new Paint();
+        emaFadePaint.setAntiAlias(false);
+        emaFadePaint.setFilterBitmap(false);
+        float fadeScale = 1.0f - emaAlpha;
+        ColorMatrix cm = new ColorMatrix();
+        cm.setScale(fadeScale, fadeScale, fadeScale, 1.0f);
+        emaFadePaint.setColorFilter(new ColorMatrixColorFilter(cm));
+
+        // EMA add paint: additive blend at α opacity
+        emaAddPaint = new Paint();
+        emaAddPaint.setAntiAlias(false);
+        emaAddPaint.setFilterBitmap(false);
+        emaAddPaint.setAlpha((int)(emaAlpha * 255));
+        emaAddPaint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.ADD));
+
+        Log.d(TAG, "EMA mini-view: " + miniW + "x" + miniH +
+                " alpha=" + emaAlpha + " maxFrames=" + (int)(Math.log(100.0) / emaAlpha));
 
         // Start timer label
         startTimeMs = System.currentTimeMillis();
@@ -178,12 +244,43 @@ public class CameraActivity extends AppCompatActivity {
         imageAnalysis.setAnalyzer(cameraExecutor, new ImageAnalysis.Analyzer() {
             @Override
             public void analyze(@NonNull ImageProxy imageProxy) {
-                // Add frame to buffer
-                frameBuffer.addFrame(imageProxy);
+                // Add frame to buffer — returns thumbnail if frame was stored, null if skipped
+                Bitmap thumb = frameBuffer.addFrame(imageProxy);
 
-                // Get delayed frame and render
+                // EMA mini-view update: only when a new frame was actually stored
+                if (thumb != null) {
+                    if (!stackInitialized) {
+                        // Seed both buffers with the first frame at full opacity so the
+                        // mini-view is immediately visible even for modes with tiny α (Sun, Saturn)
+                        Paint fullPaint = new Paint();
+                        stackCanvas.drawBitmap(thumb, 0, 0, fullPaint);
+                        // Also seed stackSrc so the first EMA step has a valid base
+                        Canvas srcCanvas = new Canvas(stackSrc);
+                        srcCanvas.drawBitmap(thumb, 0, 0, fullPaint);
+                        stackInitialized = true;
+                    } else {
+                        // Pass 1: fade old composite by (1-α)
+                        stackCanvas.drawBitmap(stackSrc, 0, 0, emaFadePaint);
+                        // Pass 2: add new frame at α opacity
+                        stackCanvas.drawBitmap(thumb, 0, 0, emaAddPaint);
+                    }
+                    thumb.recycle();
+
+                    // Post current dst to UI, then swap src/dst
+                    final Bitmap posted = stackDst;
+                    runOnUiThread(() -> stackView.setImageBitmap(posted));
+                    Bitmap tmp = stackSrc;
+                    stackSrc = stackDst;
+                    stackDst = tmp;
+                    stackCanvas.setBitmap(stackDst);
+                }
+
+                // Get delayed frame and render — only re-composite when the frame
+                // actually changes (buffer head advances). For Saturn (1fps buffer)
+                // this prevents 24 redundant JPEG decodes + canvas renders per second.
                 Bitmap delayedFrame = frameBuffer.getDelayedFrame();
-                if (delayedFrame != null) {
+                if (delayedFrame != null && delayedFrame != lastDelayedFrame) {
+                    lastDelayedFrame = delayedFrame;
                     Bitmap composited = renderer.renderFrame(delayedFrame, 0.5f);
                     runOnUiThread(() -> displayView.setImageBitmap(composited));
                 }
@@ -215,5 +312,9 @@ public class CameraActivity extends AppCompatActivity {
         if (renderer != null) {
             renderer.release();
         }
+        if (stackSrc != null && !stackSrc.isRecycled()) stackSrc.recycle();
+        if (stackDst != null && !stackDst.isRecycled()) stackDst.recycle();
+        stackSrc = null;
+        stackDst = null;
     }
 }
