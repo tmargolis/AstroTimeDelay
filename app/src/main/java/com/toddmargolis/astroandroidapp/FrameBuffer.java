@@ -24,7 +24,7 @@ public class FrameBuffer {
 
     // Motion detection constants
     private static final int LUMA_DELTA_THRESHOLD = 18;
-    private static final float MOTION_FRACTION_THRESHOLD = 0.2f;
+    private static final float MOTION_FRACTION_THRESHOLD = 0.4f;
 
     private final CelestialMode mode;
     // private final Context context; // Not used, can be removed
@@ -62,7 +62,6 @@ public class FrameBuffer {
 
     private volatile boolean released = false; // set before bitmaps are recycled
 
-    private int maxFrames;
     private int frameSkip;      // store 1 out of every N incoming frames
     private int skipCounter = 0;
     private long frameCount = 0;
@@ -73,7 +72,7 @@ public class FrameBuffer {
         this.thumbW = thumbW;
         this.thumbH = thumbH;
         this.frameSkip = Math.max(1, mode.targetFps / mode.bufferFps);
-        this.maxFrames = (int)(mode.delaySeconds * mode.bufferFps) + 1;
+        int maxFrames = (int) (mode.delaySeconds * mode.bufferFps) + 1;
         this.emaAlpha = mode.emaAlpha;
 
         if (mode.useCompression) {

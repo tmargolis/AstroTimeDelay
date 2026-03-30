@@ -25,9 +25,12 @@ import androidx.camera.core.ImageProxy;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.core.content.ContextCompat;
 
+import com.google.android.gms.tasks.OnFailureListener;
+import com.google.android.gms.tasks.OnSuccessListener;
 import com.google.common.util.concurrent.ListenableFuture;
 
 import java.util.Calendar;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -36,6 +39,7 @@ public class CameraActivity extends AppCompatActivity {
     private static final String TAG = "CameraActivity";
 
     private ImageView displayView;
+    private TextView modeLabel;
     private CelestialMode mode;
     private FrameBuffer frameBuffer;
     private OverlayRenderer renderer;
@@ -43,6 +47,7 @@ public class CameraActivity extends AppCompatActivity {
     private ProcessCameraProvider cameraProvider;
     private TextView modeIndicator;
     private TextView modeNameLabel;
+    private LinearLayout bottomLabelRow;
     private TextView queuingLabel;
     private long lastDisplayUpdateMs = 0;
     private ExecutorService displayExecutor;
@@ -50,9 +55,7 @@ public class CameraActivity extends AppCompatActivity {
 
     // Presence Detection and Screen Dimming
     private long lastMovementTimeMs = System.currentTimeMillis();
-    private long lastPresenceCheckMs = 0;
     private boolean isDimmed = false;
-    private static final long CHECK_INTERVAL_MS = 1500; // Check every 1.5 seconds
     private static final long INACTIVITY_TIMEOUT_MS = 30000; // 30 seconds for testing
     private static final float BRIGHT_LEVEL = 1.0f;
     private static final float DIM_LEVEL = 0.05f;
@@ -361,20 +364,7 @@ public class CameraActivity extends AppCompatActivity {
 
                 Bitmap thumb = frameBuffer.addFrame(imageProxy);
 
-                // Periodic presence check logic - now using motion detection instead
-                if (nowMs - lastPresenceCheckMs >= CHECK_INTERVAL_MS) {
-                    boolean motionDetected = frameBuffer.isMotionDetected();
-                    if (motionDetected) {
-                        lastMovementTimeMs = System.currentTimeMillis();
-                        updateScreenBrightness(false); // Wake up immediately on motion
-                    } else if (System.currentTimeMillis() - lastMovementTimeMs > INACTIVITY_TIMEOUT_MS) {
-                        // NO MOVEMENT FOR INACTIVITY_TIMEOUT_MS
-                        updateScreenBrightness(true); // Dim if timeout reached
-                    }
-                    lastPresenceCheckMs = nowMs;
-                }
-
-                // Check for motion detection
+                // Check for motion detection and handle screen dimming
                 if (thumb != null) {
                     boolean motionDetected = frameBuffer.isMotionDetected();
                     float motionScore = frameBuffer.getLastMotionScore();
@@ -382,6 +372,14 @@ public class CameraActivity extends AppCompatActivity {
                     // Log motion detection results (optional - can be removed)
                     if (motionDetected) {
                         Log.d(TAG, "Motion detected! Score: " + String.format("%.3f", motionScore));
+                        lastMovementTimeMs = nowMs;  // Update the last movement time when motion is detected
+                        updateScreenBrightness(false); // Wake up immediately on motion
+                    } else if (nowMs - lastMovementTimeMs > INACTIVITY_TIMEOUT_MS) {
+                        // NO MOVEMENT FOR INACTIVITY_TIMEOUT_MS
+                        // Only dim if we're not already dimmed
+                        if (!isDimmed) {
+                            updateScreenBrightness(true); // Dim if timeout reached
+                        }
                     }
 
                     updateBarcode(thumb);
