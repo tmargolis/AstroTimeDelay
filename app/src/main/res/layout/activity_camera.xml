@@ -32,7 +32,38 @@
         android:layout_gravity="bottom|end"
         android:layout_margin="16dp"
         android:scaleType="fitXY"
-        android:background="#000000" />
+        android:background="@drawable/ghost_preview_border"
+        android:padding="1dp" />
+
+    <!-- Celestial object overlay shown during QUEUEING on top of the fullscreen ghost.
+         Hidden during DELAY mode (the overlay is then composited into displayView by renderFrame).
+         Size and scaleType are set in code per mode. -->
+    <ImageView
+        android:id="@+id/countdownOverlayView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="fitCenter"
+        android:alpha="0.5"
+        android:visibility="gone" />
+
+    <!-- Movie barcode: full-width strip at the bottom showing one vertical slit per stored frame.
+         Oldest frame on left, most recent on right. Height overridden in code to match miniH.
+         During QUEUEING fills left→right; during PLAYBACK scrolls left as new frames arrive. -->
+    <ImageView
+        android:id="@+id/barcodeView"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_gravity="bottom"
+        android:scaleType="fitXY" />
+
+    <!-- Separate layer for fixed tick markers over the barcode strip.
+         Prevents ticks from scrolling or being drawn into the movie barcode history. -->
+    <ImageView
+        android:id="@+id/tickView"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_gravity="bottom"
+        android:scaleType="fitXY" />
 
     <!-- Large centered label shown while buffer is filling (on top of stackView) -->
     <TextView
@@ -47,32 +78,41 @@
         android:alpha="0.7"
         android:visibility="gone" />
 
-    <!-- Mode name + delay label, very bottom left -->
-    <TextView
-        android:id="@+id/modeNameLabel"
+    <!-- Bottom-left label row: mode name + delay, then countdown/timestamp to its right.
+         Both share a horizontal LinearLayout so the timer always sits flush right of the name.
+         Bottom margin is adjusted in code to lift the row above the barcode strip. -->
+    <LinearLayout
+        android:id="@+id/bottomLabelRow"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="bottom|start"
         android:layout_marginStart="16dp"
         android:layout_marginBottom="0dp"
-        android:text=""
-        android:textColor="#FFFFFF"
-        android:textSize="12sp"
-        android:padding="8dp"
-        android:background="#80000000" />
+        android:orientation="horizontal">
 
-    <!-- Mode indicator label in bottom right (bottom margin adjusted in code to sit above stackView) -->
-    <TextView
-        android:id="@+id/modeIndicator"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="bottom|end"
-        android:layout_marginEnd="16dp"
-        android:text="Moon"
-        android:textColor="#FFFFFF"
-        android:textSize="12sp"
-        android:padding="8dp"
-        android:fontFamily="monospace"
-        android:background="#80000000" />
+        <TextView
+            android:id="@+id/modeNameLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textColor="#FFFFFF"
+            android:textSize="12sp"
+            android:padding="8dp"
+            android:background="#80000000" />
+
+        <!-- Countdown / timestamp — sits immediately right of the mode name label -->
+        <TextView
+            android:id="@+id/modeIndicator"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="4dp"
+            android:text="Moon"
+            android:textColor="#FFFFFF"
+            android:textSize="12sp"
+            android:padding="8dp"
+            android:fontFamily="monospace"
+            android:background="#80000000" />
+
+    </LinearLayout>
 
 </FrameLayout>
