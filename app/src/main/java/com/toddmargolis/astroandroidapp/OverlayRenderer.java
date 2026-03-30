@@ -21,6 +21,19 @@ public class OverlayRenderer {
     private int tintColor;
     private CelestialMode mode;
 
+    // Pre-allocated output bitmaps (double-buffer).
+    // Eliminates 8MB Bitmap.createBitmap() on every renderFrame() call, which was
+    // causing ~120MB/sec of allocations for Sun mode (15 fps × 8MB) and triggering
+    // repeated GC pauses that froze the camera thread at the countdown→delay transition.
+    // Both bitmaps are null until the first renderFrame() call (lazy init at frame dimensions).
+    private Bitmap outA, outB;
+    private boolean useOutA = true;
+
+    // Pre-scaled overlay image and its draw position.
+    // Previously createScaledBitmap() was called inside renderFrame() on every frame —
+    // another large allocation each call. Now computed once on the first frame.
+    private Bitmap scaledOverlayImage; // null until first renderFrame()
+    private int overlayLeft, overlayTop;
 
     public OverlayRenderer(Context context, CelestialMode mode) {
         this.mode = mode;
@@ -53,72 +66,86 @@ public class OverlayRenderer {
         overlayPaint.setAntiAlias(true);
         overlayPaint.setFilterBitmap(true);
         overlayPaint.setDither(true);
-        // Removed hardcoded alpha to keep PNG transparency
     }
 
     public Bitmap renderFrame(Bitmap videoFrame, float overlayAlpha) {
-        if (videoFrame == null) {
-            return null;
-        }
+        if (videoFrame == null) return null;
 
         try {
-            // Create output bitmap
-            Bitmap output = Bitmap.createBitmap(videoFrame.getWidth(),
-                    videoFrame.getHeight(),
-                    Bitmap.Config.ARGB_8888);
-            Canvas canvas = new Canvas(output);
+            int w = videoFrame.getWidth();
+            int h = videoFrame.getHeight();
 
-            // 1. Draw delayed video with tint
-            canvas.drawBitmap(videoFrame, 0, 0, tintPaint);
-
-            // 2. Draw overlay image on top
-            if (overlayImage != null) {
-                final Bitmap overlayToDraw;
-                final int left;
-                final int top;
-
-                if (mode.name.equals("Saturn")) {
-                    // Draw at native size, top-left corner — no scaling
-                    overlayToDraw = overlayImage;
-                    left = 0;
-                    top = 0;
-                } else {
-                    // Scale to fit frame
-                    float scale = Math.min(
-                            (float)videoFrame.getWidth() / overlayImage.getWidth(),
-                            (float)videoFrame.getHeight() / overlayImage.getHeight()
-                    );
-                    if (mode.name.equals("Moon")) {
-                        scale *= 0.5f;
-                    }
-                    int scaledWidth = (int)(overlayImage.getWidth() * scale);
-                    int scaledHeight = (int)(overlayImage.getHeight() * scale);
-                    overlayToDraw = Bitmap.createScaledBitmap(overlayImage,
-                            scaledWidth, scaledHeight, true);
-
-                    if (mode.name.equals("Sun")) {
-                        left = (videoFrame.getWidth() - scaledWidth) / 2;
-                        top = 0; // aligned to top edge
-                    } else {
-                        left = (videoFrame.getWidth() - scaledWidth) / 2;
-                        top = (videoFrame.getHeight() - scaledHeight) / 2;
-                    }
+            // Lazy-init pre-allocated output bitmaps at the real frame dimensions.
+            // Recreate only if dimensions change (shouldn't happen in normal use).
+            if (outA == null || outA.getWidth() != w || outA.getHeight() != h) {
+                if (outA != null && !outA.isRecycled()) outA.recycle();
+                if (outB != null && !outB.isRecycled()) outB.recycle();
+                outA = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                outB = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                // Also reset scaled overlay so it's re-computed at new dimensions
+                if (scaledOverlayImage != null && scaledOverlayImage != overlayImage
+                        && !scaledOverlayImage.isRecycled()) {
+                    scaledOverlayImage.recycle();
                 }
-
-                overlayPaint.setAlpha((int)(255 * overlayAlpha));
-                canvas.drawBitmap(overlayToDraw, left, top, overlayPaint);
-
-                if (overlayToDraw != overlayImage) {
-                    overlayToDraw.recycle();
-                }
+                scaledOverlayImage = null;
             }
 
-            return output;
+            // Alternate between the two output bitmaps each call (double-buffer).
+            // While outA is being displayed by the ImageView, outB is being drawn to here,
+            // and vice versa — matching the same pattern used by the EMA ghost stack.
+            Bitmap out = useOutA ? outA : outB;
+            useOutA = !useOutA;
+
+            // Lazy-init scaled overlay (once per session, once dimensions are known).
+            if (overlayImage != null && scaledOverlayImage == null) {
+                initScaledOverlay(w, h);
+            }
+
+            Canvas canvas = new Canvas(out);
+
+            // 1. Draw delayed video frame with color tint
+            canvas.drawBitmap(videoFrame, 0, 0, tintPaint);
+
+            // 2. Draw pre-scaled overlay on top
+            if (scaledOverlayImage != null) {
+                overlayPaint.setAlpha((int)(255 * overlayAlpha));
+                canvas.drawBitmap(scaledOverlayImage, overlayLeft, overlayTop, overlayPaint);
+            }
+
+            return out;
 
         } catch (Exception e) {
             Log.e(TAG, "Error rendering frame", e);
             return videoFrame;
         }
+    }
+
+    /**
+     * Pre-computes scaledOverlayImage and its draw position at the given frame dimensions.
+     * Called once on the first renderFrame() invocation.
+     */
+    private void initScaledOverlay(int frameW, int frameH) {
+        if (mode.name.equals("Saturn")) {
+            // Saturn: draw at native pixel size, top-left corner — no scaling needed.
+            // Use the same overlayImage reference (do NOT recycle separately in release()).
+            scaledOverlayImage = overlayImage;
+            overlayLeft = 0;
+            overlayTop = 0;
+        } else {
+            // Moon / Sun: scale to fit the frame, maintaining aspect ratio
+            float scale = Math.min(
+                    (float) frameW / overlayImage.getWidth(),
+                    (float) frameH / overlayImage.getHeight());
+            if (mode.name.equals("Moon")) scale *= 0.5f; // Moon overlay at 50% of fit size
+            int scaledW = (int)(overlayImage.getWidth()  * scale);
+            int scaledH = (int)(overlayImage.getHeight() * scale);
+            scaledOverlayImage = Bitmap.createScaledBitmap(overlayImage, scaledW, scaledH, true);
+            overlayLeft = mode.name.equals("Sun") ? 0 : (frameW - scaledW) / 2;  // Sun: left; Moon: centered
+            overlayTop  = mode.name.equals("Sun") ? 0 : (frameH - scaledH) / 2;  // Sun: top; Moon: centered
+        }
+        Log.d(TAG, "Overlay scaled: " + scaledOverlayImage.getWidth()
+                + "x" + scaledOverlayImage.getHeight()
+                + " at (" + overlayLeft + "," + overlayTop + ")");
     }
 
     private int calculateAverageColor(Bitmap bitmap) {
@@ -159,8 +186,13 @@ public class OverlayRenderer {
     }
 
     public void release() {
-        if (overlayImage != null && !overlayImage.isRecycled()) {
-            overlayImage.recycle();
-        }
+        if (overlayImage != null && !overlayImage.isRecycled()) overlayImage.recycle();
+        // scaledOverlayImage == overlayImage for Saturn — avoid double-recycle
+        if (scaledOverlayImage != null && scaledOverlayImage != overlayImage
+                && !scaledOverlayImage.isRecycled()) scaledOverlayImage.recycle();
+        if (outA != null && !outA.isRecycled()) outA.recycle();
+        if (outB != null && !outB.isRecycled()) outB.recycle();
+        outA = null;
+        outB = null;
     }
 }

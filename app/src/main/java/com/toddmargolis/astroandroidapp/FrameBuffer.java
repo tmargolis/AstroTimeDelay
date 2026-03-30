@@ -1,16 +1,17 @@
 package com.toddmargolis.astroandroidapp;
 
-import android.content.ContentValues;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.media.Image;
-import android.net.Uri;
-import android.provider.MediaStore;
 import android.util.Log;
+
+import androidx.annotation.OptIn;
+import androidx.camera.core.ExperimentalGetImage;
 import androidx.camera.core.ImageProxy;
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
@@ -21,30 +22,45 @@ public class FrameBuffer {
     private static final String TAG = "FrameBuffer";
     private static final int JPEG_QUALITY = 60;
 
+    // Motion detection constants
+    private static final int LUMA_DELTA_THRESHOLD = 18;
+    private static final float MOTION_FRACTION_THRESHOLD = 0.2f;
+
     private final CelestialMode mode;
-    private final Context context;
+    // private final Context context; // Not used, can be removed
 
     // Thumbnail dimensions for the EMA mini-view
     private final int thumbW;
     private final int thumbH;
-    private final float emaAlpha; // α = ln(100) / maxFrames
+    private final float emaAlpha;
 
     // RAM path (Moon)
     private ArrayDeque<Bitmap> bitmapBuffer;
     private ArrayDeque<Long> timestampBuffer;
 
-    // Disk path (Sun, Saturn) — stored via MediaStore in Pictures/AstroTimeDelay/
-    private ArrayDeque<Uri> uriBuffer;
+    // Disk path (Sun, Saturn) — stored as JPEG files in app-private external storage.
+    // Using getExternalFilesDir() avoids the MediaStore media scanner, which caused a
+    // ~1-minute freeze when 7,500+ buffer files triggered scanner backlog at mode transition.
+    private ArrayDeque<File> fileBuffer;
     private ArrayDeque<Long> diskTimestampBuffer;
-    private String sessionRelativePath;
-    // Cache the last decoded frame so we only hit MediaStore when the buffer head actually advances
+    private File sessionDir;
+    // Cache the last decoded frame so we only hit disk when the buffer head actually advances
     private Bitmap cachedFrame;
-    private Uri cachedUri;
+    private File cachedFile;
+    
+    private Bitmap lastStoredThumb; // Copy of the most recently stored frame's thumbnail
+
+    // Motion detection state
+    private Bitmap previousThumb;
+    private boolean motionDetected = false;
+    private float lastMotionScore = 0.0f;
 
     private static final SimpleDateFormat FOLDER_FMT =
-            new SimpleDateFormat("yyyy-MM-dd:HH:mm:ss", Locale.US);
+            new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US);
     private static final SimpleDateFormat FILE_FMT =
             new SimpleDateFormat("yyyy.MM.dd.HH.mm.ss.SSS", Locale.US);
+
+    private volatile boolean released = false; // set before bitmaps are recycled
 
     private int maxFrames;
     private int frameSkip;      // store 1 out of every N incoming frames
@@ -53,18 +69,22 @@ public class FrameBuffer {
     private long firstFrameTimeMs = 0;
 
     public FrameBuffer(Context context, CelestialMode mode, int thumbW, int thumbH) {
-        this.context = context;
         this.mode = mode;
         this.thumbW = thumbW;
         this.thumbH = thumbH;
         this.frameSkip = Math.max(1, mode.targetFps / mode.bufferFps);
         this.maxFrames = (int)(mode.delaySeconds * mode.bufferFps) + 1;
-        this.emaAlpha = (float)(Math.log(100.0) / maxFrames);
+        this.emaAlpha = mode.emaAlpha;
 
         if (mode.useCompression) {
             String startTime = FOLDER_FMT.format(new Date());
-            sessionRelativePath = "Pictures/AstroTimeDelay/" + mode.name + "_" + startTime + "/";
-            uriBuffer = new ArrayDeque<>();
+            // App-private external storage: not visible in gallery, no media scanner,
+            // no permissions needed on API 26+, cleaned up on uninstall.
+            File baseDir = context.getExternalFilesDir(null);
+            if (baseDir == null) baseDir = context.getFilesDir(); // fallback to internal
+            sessionDir = new File(baseDir, "AstroTimeDelay/" + mode.name + "_" + startTime);
+            sessionDir.mkdirs();
+            fileBuffer = new ArrayDeque<>();
             diskTimestampBuffer = new ArrayDeque<>();
         } else {
             bitmapBuffer = new ArrayDeque<>();
@@ -75,7 +95,7 @@ public class FrameBuffer {
                 " maxFrames=" + maxFrames +
                 " frameSkip=" + frameSkip +
                 " disk=" + mode.useCompression +
-                (mode.useCompression ? " path=" + sessionRelativePath : ""));
+                (mode.useCompression ? " path=" + sessionDir : ""));
     }
 
     public long getFirstFrameTimeMs() { return firstFrameTimeMs; }
@@ -83,17 +103,54 @@ public class FrameBuffer {
     public float getEmaAlpha() { return emaAlpha; }
 
     /**
+     * Returns true once the oldest buffered frame is at least delaySeconds old —
+     * i.e., the display pipeline can begin showing time-delayed content.
+     * Time-based (not count-based) so it works correctly even when the actual
+     * stored frame rate is lower than bufferFps (e.g., due to JPEG encode overhead).
+     */
+    public synchronized boolean isBufferFull() {
+        long thresholdMs = System.currentTimeMillis() - (long)(mode.delaySeconds * 1000);
+        Long oldest;
+        if (mode.useCompression) {
+            oldest = diskTimestampBuffer.peek();
+        } else {
+            oldest = timestampBuffer.peek();
+        }
+        return oldest != null && oldest <= thresholdMs;
+    }
+
+    /**
+     * Returns true if motion was detected in the most recently stored frame
+     */
+    public synchronized boolean isMotionDetected() {
+        return motionDetected;
+    }
+
+    /**
+     * Returns the last computed motion score (fraction of pixels changed)
+     */
+    public synchronized float getLastMotionScore() {
+        return lastMotionScore;
+    }
+
+    /**
      * Adds a frame to the buffer. Returns a thumbnail Bitmap (thumbW × thumbH) if the frame
      * was stored, or null if it was skipped (frameSkip). Caller is responsible for recycling
      * the returned thumbnail after use.
      */
     public Bitmap addFrame(ImageProxy imageProxy) {
+        if (released) return null;
         try {
             skipCounter++;
-            if (skipCounter < frameSkip) {
-                return null;
-            }
-            skipCounter = 0;
+            boolean shouldStore = (skipCounter >= frameSkip);
+            if (shouldStore) skipCounter = 0;
+
+            // Always decode and return a thumbnail for the very first camera frame,
+            // regardless of frameSkip. For Saturn (frameSkip=24), this means the ghost
+            // stack seeds immediately instead of waiting ~1 second for the first stored frame.
+            // On all subsequent non-stored frames, skip decoding entirely (return null).
+            boolean isFirstFrame = (frameCount == 0);
+            if (!shouldStore && !isFirstFrame) return null;
 
             Bitmap bitmap = imageProxyToBitmap(imageProxy);
             if (bitmap == null) return null;
@@ -101,24 +158,63 @@ public class FrameBuffer {
             frameCount++;
             if (frameCount == 1) firstFrameTimeMs = System.currentTimeMillis();
 
+            // First-frame-only seed: generate thumbnail, skip storage, return immediately
+            if (!shouldStore) {
+                Bitmap thumb = Bitmap.createScaledBitmap(bitmap, thumbW, thumbH, true);
+                bitmap.recycle();
+                return thumb;
+            }
+
             // Generate thumbnail BEFORE any recycle call
             Bitmap thumb = Bitmap.createScaledBitmap(bitmap, thumbW, thumbH, true);
+
+            // Keep a deep copy of the latest thumb for presence detection
+            synchronized (this) {
+                if (lastStoredThumb != null && !lastStoredThumb.isRecycled()) {
+                    lastStoredThumb.recycle();
+                }
+                lastStoredThumb = thumb.copy(thumb.getConfig(), false);
+            }
 
             if (mode.useCompression) {
                 addFrameToDisk(bitmap);
                 bitmap.recycle();
             } else {
+                long nowMs = System.currentTimeMillis();
                 bitmapBuffer.add(bitmap);
-                timestampBuffer.add(System.currentTimeMillis());
-                while (bitmapBuffer.size() > maxFrames) {
+                timestampBuffer.add(nowMs);
+                // Time-based eviction: discard frames older than delaySeconds so the
+                // display head always reflects the correct wall-clock delay.
+                long evictBefore = nowMs - (long)(mode.delaySeconds * 1000);
+                while (!timestampBuffer.isEmpty() && timestampBuffer.peek() < evictBefore) {
                     Bitmap old = bitmapBuffer.poll();
                     if (old != null && !old.isRecycled()) old.recycle();
                     timestampBuffer.poll();
                 }
             }
 
+            // Perform motion detection using the thumbnail
+            synchronized (this) {
+                if (previousThumb != null && !previousThumb.isRecycled()) {
+                    // Calculate motion score from difference between current and previous thumbnail
+                    float motionScore = calculateMotionScore(thumb, previousThumb);
+                    motionDetected = motionScore >= MOTION_FRACTION_THRESHOLD;
+                    lastMotionScore = motionScore;
+                } else {
+                    // First frame - no previous thumb to compare to
+                    motionDetected = false;
+                    lastMotionScore = 0.0f;
+                }
+                
+                // Update previous thumb for next frame
+                if (previousThumb != null && !previousThumb.isRecycled()) {
+                    previousThumb.recycle();
+                }
+                previousThumb = thumb.copy(thumb.getConfig(), false);
+            }
+
             if (frameCount % 30 == 0) {
-                int size = mode.useCompression ? uriBuffer.size() : bitmapBuffer.size();
+                int size = mode.useCompression ? fileBuffer.size() : bitmapBuffer.size();
                 Log.d(TAG, "Buffer: " + size + " frames");
             }
 
@@ -129,66 +225,72 @@ public class FrameBuffer {
         }
     }
 
+    /**
+     * Returns a guaranteed deep copy of the most recently stored thumbnail. 
+     * Caller is responsible for recycling the returned bitmap.
+     */
+    public synchronized Bitmap getLatestThumbnail() {
+        if (lastStoredThumb == null || lastStoredThumb.isRecycled()) return null;
+        return lastStoredThumb.copy(lastStoredThumb.getConfig(), false);
+    }
+
     private void addFrameToDisk(Bitmap bitmap) {
-        try {
-            long captureTimeMs = System.currentTimeMillis();
-            String filename = FILE_FMT.format(new Date(captureTimeMs)) + ".jpg";
+        long captureTimeMs = System.currentTimeMillis();
+        String filename = FILE_FMT.format(new Date(captureTimeMs)) + ".jpg";
+        File file = new File(sessionDir, filename);
 
-            ContentValues values = new ContentValues();
-            values.put(MediaStore.Images.Media.DISPLAY_NAME, filename);
-            values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
-            values.put(MediaStore.Images.Media.RELATIVE_PATH, sessionRelativePath);
+        // File write outside lock — this is the slow part (50-100 ms JPEG encode).
+        // The display thread may call getDelayedFrame() concurrently; it only touches
+        // the queue under its own synchronized block, so no conflict here.
+        try (FileOutputStream fos = new FileOutputStream(file)) {
+            bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, fos);
+        } catch (IOException e) {
+            Log.e(TAG, "Error writing frame to disk", e);
+            return;
+        }
 
-            Uri uri = context.getContentResolver().insert(
-                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
-            if (uri == null) {
-                Log.e(TAG, "MediaStore insert returned null URI");
-                return;
-            }
-
-            try (OutputStream out = context.getContentResolver().openOutputStream(uri)) {
-                if (out != null) {
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out);
-                }
-            }
-
-            uriBuffer.add(uri);
+        // Queue operations under lock — shared with getDelayedFrame() on display thread.
+        // Time-based eviction: discard frames older than delaySeconds so the display
+        // head always reflects the correct wall-clock delay, even when actual frame
+        // storage rate is lower than bufferFps (e.g., due to JPEG encode overhead).
+        synchronized (this) {
+            fileBuffer.add(file);
             diskTimestampBuffer.add(captureTimeMs);
-
-            while (uriBuffer.size() > maxFrames) {
-                Uri old = uriBuffer.poll();
-                if (old != null) context.getContentResolver().delete(old, null, null);
+            long evictBefore = captureTimeMs - (long)(mode.delaySeconds * 1000);
+            while (!diskTimestampBuffer.isEmpty() && diskTimestampBuffer.peek() < evictBefore) {
+                File old = fileBuffer.poll();
+                if (old != null) old.delete();
                 diskTimestampBuffer.poll();
             }
-        } catch (Exception e) {
-            Log.e(TAG, "Error writing frame to MediaStore", e);
         }
     }
 
     public Bitmap getDelayedFrame() {
+        if (released) return null;
         if (mode.useCompression) {
-            Uri uri = uriBuffer.peek();
-            if (uri == null) return null;
-
-            // Only decode from MediaStore when the buffer head has actually advanced.
-            // Without this, every camera frame (24fps for Saturn) would decode the same
-            // JPEG from MediaStore, causing massive I/O load and eventual freeze.
-            if (uri.equals(cachedUri) && cachedFrame != null && !cachedFrame.isRecycled()) {
-                return cachedFrame;
+            // Snapshot head file and check cache under lock (fast — no I/O).
+            // Must be synchronized against addFrameToDisk() which evicts from the same deques.
+            File file;
+            synchronized (this) {
+                file = fileBuffer.peek();
+                if (file != null && file.equals(cachedFile)
+                        && cachedFrame != null && !cachedFrame.isRecycled()) {
+                    return cachedFrame; // cache hit — already decoded, no disk read needed
+                }
             }
+            if (file == null) return null;
 
-            try (InputStream in = context.getContentResolver().openInputStream(uri)) {
-                if (in == null) return cachedFrame; // fall back to last good frame on I/O failure
-                Bitmap decoded = BitmapFactory.decodeStream(in);
+            // Cache miss — decode outside lock (50-200 ms; must not block camera thread).
+            Bitmap decoded = BitmapFactory.decodeFile(file.getAbsolutePath());
+
+            synchronized (this) {
                 if (decoded != null) {
                     if (cachedFrame != null && !cachedFrame.isRecycled()) cachedFrame.recycle();
                     cachedFrame = decoded;
-                    cachedUri = uri;
+                    cachedFile = file;
                 }
+                // Return cached frame even if decode failed (file may have been evicted mid-decode).
                 return cachedFrame;
-            } catch (Exception e) {
-                Log.e(TAG, "Error reading frame from MediaStore", e);
-                return cachedFrame; // fall back to last good frame on error
             }
         } else {
             if (bitmapBuffer.isEmpty()) return null;
@@ -203,16 +305,61 @@ public class FrameBuffer {
      * For RAM mode (Moon): from timestampBuffer (recorded at add time).
      * Returns 0 if no frame is available yet.
      */
-    public long getCurrentFrameTimestamp() {
+    public synchronized long getCurrentFrameTimestamp() {
+        Long ts;
         if (mode.useCompression) {
-            Long ts = diskTimestampBuffer.peek();
-            return ts != null ? ts : 0;
+            ts = diskTimestampBuffer.peek();
         } else {
-            Long ts = timestampBuffer.peek();
-            return ts != null ? ts : 0;
+            ts = timestampBuffer.peek();
         }
+        return ts != null ? ts : 0;
     }
 
+    /**
+     * Calculate motion score by comparing pixels between current and previous thumbnails
+     * @param currentThumb the current thumbnail bitmap
+     * @param previousThumb the previous thumbnail bitmap
+     * @return fraction of pixels with luma difference exceeding threshold
+     */
+    private float calculateMotionScore(Bitmap currentThumb, Bitmap previousThumb) {
+        if (currentThumb == null || previousThumb == null) return 0.0f;
+        
+        int width = currentThumb.getWidth();
+        int height = currentThumb.getHeight();
+        int totalPixels = width * height;
+        int changedPixels = 0;
+        
+        // Using a simple scan approach for better performance
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                int currentPixel = currentThumb.getPixel(x, y);
+                int previousPixel = previousThumb.getPixel(x, y);
+                
+                // Convert to luma using fast approximation: (r * 77 + g * 150 + b * 29) >> 8
+                int currentR = (currentPixel >> 16) & 0xFF;
+                int currentG = (currentPixel >> 8) & 0xFF;
+                int currentB = currentPixel & 0xFF;
+                
+                int previousR = (previousPixel >> 16) & 0xFF;
+                int previousG = (previousPixel >> 8) & 0xFF;
+                int previousB = previousPixel & 0xFF;
+                
+                // Calculate luma for both pixels
+                int currentLuma = (currentR * 77 + currentG * 150 + currentB * 29) >> 8;
+                int previousLuma = (previousR * 77 + previousG * 150 + previousB * 29) >> 8;
+                
+                // Calculate absolute difference
+                int delta = Math.abs(currentLuma - previousLuma);
+                if (delta >= LUMA_DELTA_THRESHOLD) {
+                    changedPixels++;
+                }
+            }
+        }
+
+        return (float) changedPixels / totalPixels;
+    }
+
+    @OptIn(markerClass = ExperimentalGetImage.class)
     private Bitmap imageProxyToBitmap(ImageProxy imageProxy) {
         try {
             Image image = imageProxy.getImage();
@@ -244,15 +391,18 @@ public class FrameBuffer {
     }
 
     public void release() {
+        released = true; // stop addFrame() ASAP if camera thread is still running
         if (mode.useCompression) {
-            for (Uri uri : uriBuffer) {
-                if (uri != null) context.getContentResolver().delete(uri, null, null);
+            for (File f : fileBuffer) {
+                if (f != null) f.delete();
             }
-            uriBuffer.clear();
+            fileBuffer.clear();
             diskTimestampBuffer.clear();
             if (cachedFrame != null && !cachedFrame.isRecycled()) cachedFrame.recycle();
             cachedFrame = null;
-            cachedUri = null;
+            cachedFile = null;
+            // Remove session directory (succeeds if empty after deletes above)
+            if (sessionDir != null) sessionDir.delete();
         } else {
             for (Bitmap b : bitmapBuffer) {
                 if (b != null && !b.isRecycled()) b.recycle();
@@ -260,6 +410,19 @@ public class FrameBuffer {
             bitmapBuffer.clear();
             timestampBuffer.clear();
         }
+        
+        synchronized (this) {
+            if (lastStoredThumb != null && !lastStoredThumb.isRecycled()) {
+                lastStoredThumb.recycle();
+            }
+            lastStoredThumb = null;
+            
+            if (previousThumb != null && !previousThumb.isRecycled()) {
+                previousThumb.recycle();
+            }
+            previousThumb = null;
+        }
+
         Log.d(TAG, "FrameBuffer released");
     }
 }
