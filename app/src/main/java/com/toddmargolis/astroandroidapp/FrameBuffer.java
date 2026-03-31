@@ -24,7 +24,7 @@ public class FrameBuffer {
 
     // Motion detection constants
     private static final int LUMA_DELTA_THRESHOLD = 18;
-    private static final float MOTION_FRACTION_THRESHOLD = 0.4f;
+    private static final float MOTION_FRACTION_THRESHOLD = 0.005f;
 
     private final CelestialMode mode;
     // private final Context context; // Not used, can be removed
