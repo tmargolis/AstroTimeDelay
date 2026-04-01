@@ -67,6 +67,10 @@ public class FrameBuffer {
     private long frameCount = 0;
     private long firstFrameTimeMs = 0;
 
+    // Checkpoint support for persistence
+    private static final String CHECKPOINT_FILE_NAME = "framebuffer_checkpoint.dat";
+    private File checkpointFile;
+
     public FrameBuffer(Context context, CelestialMode mode, int thumbW, int thumbH) {
         this.mode = mode;
         this.thumbW = thumbW;
@@ -76,15 +80,40 @@ public class FrameBuffer {
         this.emaAlpha = mode.emaAlpha;
 
         if (mode.useCompression) {
+            // Check for existing checkpoint files to restore previous session
             String startTime = FOLDER_FMT.format(new Date());
-            // App-private external storage: not visible in gallery, no media scanner,
-            // no permissions needed on API 26+, cleaned up on uninstall.
             File baseDir = context.getExternalFilesDir(null);
             if (baseDir == null) baseDir = context.getFilesDir(); // fallback to internal
-            sessionDir = new File(baseDir, "AstroTimeDelay/" + mode.name + "_" + startTime);
-            sessionDir.mkdirs();
-            fileBuffer = new ArrayDeque<>();
-            diskTimestampBuffer = new ArrayDeque<>();
+            
+            // Look for existing sessions for this mode
+            File[] existingSessions = findExistingSessions(baseDir, mode.name);
+            File restoreSessionDir = null;
+            
+            if (existingSessions != null && existingSessions.length > 0) {
+                // Use the most recent session
+                restoreSessionDir = existingSessions[0];
+                Log.d(TAG, "Found existing session to restore: " + restoreSessionDir.getAbsolutePath());
+            }
+            
+            if (restoreSessionDir != null) {
+                // Restore from existing session directory
+                sessionDir = restoreSessionDir;
+                checkpointFile = new File(sessionDir, CHECKPOINT_FILE_NAME);
+                
+                // Initialize buffers by scanning existing files
+                restoreFromExistingSession();
+            } else {
+                // Create new session directory
+                String sessionName = mode.name + "_" + startTime;
+                sessionDir = new File(baseDir, "AstroTimeDelay/" + sessionName);
+                sessionDir.mkdirs();
+                
+                // Create checkpoint file for this session
+                checkpointFile = new File(sessionDir, CHECKPOINT_FILE_NAME);
+                
+                fileBuffer = new ArrayDeque<>();
+                diskTimestampBuffer = new ArrayDeque<>();
+            }
         } else {
             bitmapBuffer = new ArrayDeque<>();
             timestampBuffer = new ArrayDeque<>();
@@ -95,6 +124,109 @@ public class FrameBuffer {
                 " frameSkip=" + frameSkip +
                 " disk=" + mode.useCompression +
                 (mode.useCompression ? " path=" + sessionDir : ""));
+    }
+    
+    /**
+     * Find existing sessions for a given mode name, sorted by most recent
+     */
+    private File[] findExistingSessions(File baseDir, String modeName) {
+        try {
+            File astroDir = new File(baseDir, "AstroTimeDelay");
+            if (!astroDir.exists()) return null;
+            
+            File[] sessions = astroDir.listFiles((dir, name) -> 
+                name.startsWith(modeName + "_"));
+            
+            if (sessions != null && sessions.length > 0) {
+                // Sort by modification time - most recent first
+                java.util.Arrays.sort(sessions, (a, b) -> {
+                    long timeA = a.lastModified();
+                    long timeB = b.lastModified();
+                    return Long.compare(timeB, timeA); // Most recent first
+                });
+                return sessions;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error finding existing sessions", e);
+        }
+        return null;
+    }
+    
+    /**
+     * Restore buffer state from an existing session directory
+     */
+    private void restoreFromExistingSession() {
+        try {
+            if (sessionDir == null || !sessionDir.exists()) return;
+            
+            fileBuffer = new ArrayDeque<>();
+            diskTimestampBuffer = new ArrayDeque<>();
+            
+            // Get list of all JPEG files in the session directory, sorted by name
+            File[] jpegFiles = sessionDir.listFiles((dir, name) -> 
+                name.toLowerCase().endsWith(".jpg"));
+            
+            if (jpegFiles != null) {
+                java.util.Arrays.sort(jpegFiles, (a, b) -> a.getName().compareTo(b.getName()));
+                
+                // Add all files to buffer (will be evicted properly based on timestamps)
+                for (File file : jpegFiles) {
+                    if (file.isFile()) {
+                        long timestamp = extractTimestampFromFile(file);
+                        if (timestamp > 0) {
+                            fileBuffer.add(file);
+                            diskTimestampBuffer.add(timestamp);
+                        }
+                    }
+                }
+                
+                Log.d(TAG, "Restored " + fileBuffer.size() + " frames from existing session");
+            }
+            
+            // Check if there's a valid checkpoint to determine the starting point
+            long checkpointTimestamp = getCheckpointTimestamp();
+            if (checkpointTimestamp > 0) {
+                Log.d(TAG, "Using checkpoint timestamp: " + checkpointTimestamp);
+                // Set the first frame time based on checkpoint for proper delay calculation
+                this.firstFrameTimeMs = checkpointTimestamp;
+            } else {
+                Log.d(TAG, "No checkpoint found in restored session");
+                // If no checkpoint and we have frames, use the oldest frame as start time
+                if (!diskTimestampBuffer.isEmpty()) {
+                    Long oldest = diskTimestampBuffer.peek();
+                    if (oldest != null) {
+                        this.firstFrameTimeMs = oldest;
+                        Log.d(TAG, "Using oldest frame timestamp as start time: " + firstFrameTimeMs);
+                    }
+                }
+            }
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Error restoring from existing session", e);
+            // If restoration fails, fall back to empty buffers
+            fileBuffer = new ArrayDeque<>();
+            diskTimestampBuffer = new ArrayDeque<>();
+        }
+    }
+    
+    /**
+     * Extract timestamp from filename
+     */
+    private long extractTimestampFromFile(File file) {
+        try {
+            String filename = file.getName();
+            int dotIndex = filename.lastIndexOf('.');
+            if (dotIndex > 0) {
+                String timestampPart = filename.substring(0, dotIndex);
+                Date date = FILE_FMT.parse(timestampPart);
+                if (date != null) {
+                    return date.getTime();
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error parsing timestamp from file: " + file.getName(), e);
+        }
+        return 0;
     }
 
     public long getFirstFrameTimeMs() { return firstFrameTimeMs; }
@@ -261,6 +393,9 @@ public class FrameBuffer {
                 if (old != null) old.delete();
                 diskTimestampBuffer.poll();
             }
+            
+            // Save checkpoint regularly to maintain persistence
+            saveCheckpoint();
         }
     }
 
@@ -423,5 +558,56 @@ public class FrameBuffer {
         }
 
         Log.d(TAG, "FrameBuffer released");
+    }
+    
+    /**
+     * Save checkpoint information for persistence
+     */
+    private void saveCheckpoint() {
+        // Only do this for disk-based modes (Sun/Saturn) to avoid unnecessary overhead
+        if (!mode.useCompression) {
+            return;
+        }
+        
+        try {
+            long headTimestamp = getCurrentFrameTimestamp();
+            if (headTimestamp > 0) {
+                // Write timestamp of first frame in buffer as checkpoint - this preserves our position
+                Log.d(TAG, "Saving checkpoint: head timestamp=" + headTimestamp);
+                
+                // Write the timestamp to our checkpoint file
+                java.io.FileWriter writer = new java.io.FileWriter(checkpointFile);
+                writer.write(String.valueOf(headTimestamp));
+                writer.close();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error saving checkpoint", e);
+        }
+    }
+
+    /**
+     * Check if there's a saved checkpoint and return timestamp information for recovery
+     * @return timestamp of checkpointed head frame, or 0 if no checkpoint exists
+     */
+    public long getCheckpointTimestamp() {
+        if (!mode.useCompression) {
+            return 0;
+        }
+        
+        try {
+            if (checkpointFile.exists()) {
+                java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(checkpointFile));
+                String line = reader.readLine();
+                reader.close();
+                
+                if (line != null && !line.isEmpty()) {
+                    return Long.parseLong(line);
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error reading checkpoint", e);
+        }
+
+        return 0;
     }
 }

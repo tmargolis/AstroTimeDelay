@@ -87,6 +87,10 @@ public class CameraActivity extends AppCompatActivity {
     private int[] rowAvgScratch;
     private float barcodeHistorySeconds;
 
+    // Checkpoint support
+    private static final String PREFS_NAME = "AstroTimeDelayPrefs";
+    private static final String CHECKPOINT_KEY_PREFIX = "checkpoint_";
+    
     private final Handler timerHandler = new Handler(Looper.getMainLooper());
     private final Runnable timerRunnable = new Runnable() {
         @Override public void run() {
@@ -130,6 +134,11 @@ public class CameraActivity extends AppCompatActivity {
         frameBuffer = new FrameBuffer(this, mode, miniW, miniH);
         renderer = new OverlayRenderer(this, mode);
 
+        // Restore state if available for disk-based modes
+        if (mode.useCompression) {
+            restoreState();
+        }
+
         stackView = findViewById(R.id.stackView);
         countdownOverlayView = findViewById(R.id.countdownOverlayView);
         countdownOverlayView.setImageResource(mode.overlayResourceId);
@@ -165,7 +174,8 @@ public class CameraActivity extends AppCompatActivity {
 
         barcodeW = dm.widthPixels - cornerW;
         barcodeH = cornerH;
-        barcodeHistorySeconds = mode.name.equals("Moon") ? 80.0f : mode.delaySeconds;
+        // Use the mode's delay seconds for consistent timeline length across all modes
+        barcodeHistorySeconds = mode.delaySeconds;
 
         barcodeDisplay1 = Bitmap.createBitmap(barcodeW, barcodeH, Bitmap.Config.ARGB_8888);
         barcodeDisplay2 = Bitmap.createBitmap(barcodeW, barcodeH, Bitmap.Config.ARGB_8888);
@@ -459,6 +469,11 @@ public class CameraActivity extends AppCompatActivity {
             }
         }
 
+        // Save state when app is destroyed for disk-based modes
+        if (mode.useCompression) {
+            saveState();
+        }
+
         if (frameBuffer != null) frameBuffer.release();
         if (renderer != null) renderer.release();
         if (stackDisplay1 != null && !stackDisplay1.isRecycled()) stackDisplay1.recycle();
@@ -538,5 +553,54 @@ public class CameraActivity extends AppCompatActivity {
             stackPixels[i] = 0xFF000000 | (r << 16) | (g << 8) | b;
         }
         dst.setPixels(stackPixels, 0, miniW, 0, 0, miniW, miniH);
+    }
+    
+    /**
+     * Save the current state for recovery from crashes or app stops
+     */
+    private void saveState() {
+        if (mode.useCompression) {
+            // For disk-based modes (Sun/Saturn), the frames are already being saved
+            // The system handles eviction and persistence automatically by design
+            Log.d(TAG, "Saved checkpoint state for mode: " + mode.name);
+            
+            // Save timestamp to checkpoint file - this is handled automatically 
+            // by the FrameBuffer's saveCheckpoint() method called during frame storage
+        }
+    }
+    
+    /**
+     * Restore state from previous session if available
+     */
+    private void restoreState() {
+        if (mode.useCompression) {
+            // For disk-based modes, check if there are existing files to determine 
+            // if we can continue from previous buffer state
+            Log.d(TAG, "Restoring checkpoint state for mode: " + mode.name);
+            
+            // The system will naturally handle persistence based on file timestamps
+            // We don't need complex recovery logic - the file system automatically
+            // manages eviction and continues from where it left off.
+            // The only thing we check is if the session exists and has data
+            
+            long checkpointTimestamp = frameBuffer.getCheckpointTimestamp();
+            if (checkpointTimestamp > 0) {
+                Log.d(TAG, "Found existing checkpoint with timestamp: " + checkpointTimestamp);
+                // The system will continue normally from this point
+                // All frames are automatically managed by timestamp-based eviction
+                
+                // Force a UI update to reflect playback state if needed
+                long currentTime = System.currentTimeMillis();
+                float elapsedSecs = (currentTime - checkpointTimestamp) / 1000f;
+                boolean shouldPlayback = elapsedSecs >= mode.delaySeconds;
+                
+                if (shouldPlayback) {
+                    isPlaybackPhase = true;
+                    Log.d(TAG, "Forced playback phase due to restored checkpoint");
+                }
+            } else {
+                Log.d(TAG, "No existing checkpoint found - starting fresh session");
+            }
+        }
     }
 }
