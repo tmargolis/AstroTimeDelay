@@ -90,9 +90,13 @@ public class FrameBuffer {
             File restoreSessionDir = null;
             
             if (existingSessions != null && existingSessions.length > 0) {
-                // Use the most recent session
+                // Use the most recent session; delete any older ones to prevent accumulation
                 restoreSessionDir = existingSessions[0];
                 Log.d(TAG, "Found existing session to restore: " + restoreSessionDir.getAbsolutePath());
+                for (int i = 1; i < existingSessions.length; i++) {
+                    deleteDirectory(existingSessions[i]);
+                    Log.d(TAG, "Deleted old session: " + existingSessions[i].getName());
+                }
             }
             
             if (restoreSessionDir != null) {
@@ -287,7 +291,8 @@ public class FrameBuffer {
             if (bitmap == null) return null;
 
             frameCount++;
-            if (frameCount == 1) firstFrameTimeMs = System.currentTimeMillis();
+            // Only set firstFrameTimeMs from live camera if not already restored from disk
+            if (frameCount == 1 && firstFrameTimeMs == 0) firstFrameTimeMs = System.currentTimeMillis();
 
             // First-frame-only seed: generate thumbnail, skip storage, return immediately
             if (!shouldStore) {
@@ -527,16 +532,13 @@ public class FrameBuffer {
     public void release() {
         released = true; // stop addFrame() ASAP if camera thread is still running
         if (mode.useCompression) {
-            for (File f : fileBuffer) {
-                if (f != null) f.delete();
-            }
+            // Clear in-memory state only — leave JPEG files on disk so the next
+            // session can restore the barcode and buffer from them.
             fileBuffer.clear();
             diskTimestampBuffer.clear();
             if (cachedFrame != null && !cachedFrame.isRecycled()) cachedFrame.recycle();
             cachedFrame = null;
             cachedFile = null;
-            // Remove session directory (succeeds if empty after deletes above)
-            if (sessionDir != null) sessionDir.delete();
         } else {
             for (Bitmap b : bitmapBuffer) {
                 if (b != null && !b.isRecycled()) b.recycle();
@@ -560,6 +562,37 @@ public class FrameBuffer {
         Log.d(TAG, "FrameBuffer released");
     }
     
+    /**
+     * Returns a snapshot of the timestamps currently in the disk buffer, oldest first.
+     * Only meaningful for disk-based modes (Sun/Saturn).
+     */
+    public synchronized long[] getBufferedTimestamps() {
+        if (!mode.useCompression || diskTimestampBuffer == null) return new long[0];
+        long[] result = new long[diskTimestampBuffer.size()];
+        int i = 0;
+        for (long ts : diskTimestampBuffer) result[i++] = ts;
+        return result;
+    }
+
+    /**
+     * Returns a snapshot of the files currently in the disk buffer, oldest first.
+     * Only meaningful for disk-based modes (Sun/Saturn).
+     */
+    public synchronized File[] getBufferedFiles() {
+        if (!mode.useCompression || fileBuffer == null) return new File[0];
+        return fileBuffer.toArray(new File[0]);
+    }
+
+    /** Recursively delete a directory and all its contents. */
+    private void deleteDirectory(File dir) {
+        if (dir == null || !dir.exists()) return;
+        File[] children = dir.listFiles();
+        if (children != null) {
+            for (File child : children) child.delete();
+        }
+        dir.delete();
+    }
+
     /**
      * Save checkpoint information for persistence
      */

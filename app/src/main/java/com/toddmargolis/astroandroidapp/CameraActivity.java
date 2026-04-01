@@ -1,6 +1,7 @@
 package com.toddmargolis.astroandroidapp;
 
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Matrix;
 import android.graphics.Paint;
@@ -29,6 +30,8 @@ import com.google.android.gms.tasks.OnFailureListener;
 import com.google.android.gms.tasks.OnSuccessListener;
 import com.google.common.util.concurrent.ListenableFuture;
 
+import java.io.File;
+import java.util.ArrayDeque;
 import java.util.Calendar;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
@@ -79,13 +82,19 @@ public class CameraActivity extends AppCompatActivity {
     private int barcodeW, barcodeH;
     private float barcodeAccum = 0f;
     private long lastBarcodeFrameMs = 0;
-    private int barcodeFrameCount = 0;
+    private volatile int barcodeFrameCount = 0;
     private Bitmap barcodeDisplay1, barcodeDisplay2;
     private Canvas barcodeCanvas1, barcodeCanvas2;
-    private boolean useBarcodeDisplay1 = true;
+    private volatile boolean useBarcodeDisplay1 = true;
     private int[] slitPixels;
     private int[] rowAvgScratch;
     private float barcodeHistorySeconds;
+    private volatile boolean barcodeHistoryLoading = false;
+
+    // Moon-mode barcode: thumbnail copies of each buffered frame, drawn as scaled tiles
+    private ArrayDeque<Bitmap> moonBarcodeBuffer;
+    private int maxMoonBarcodeFrames;
+    private Paint moonBarcodePaint;
 
     // Checkpoint support
     private static final String PREFS_NAME = "AstroTimeDelayPrefs";
@@ -187,6 +196,12 @@ public class CameraActivity extends AppCompatActivity {
         slitPixels = new int[barcodeH];
         rowAvgScratch = new int[miniW * barcodeH];
 
+        if (!mode.useCompression) {
+            maxMoonBarcodeFrames = (int)(mode.delaySeconds * mode.bufferFps) + 1;
+            moonBarcodeBuffer = new ArrayDeque<>();
+            moonBarcodePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+        }
+
         tickView = findViewById(R.id.tickView);
         barcodeView = findViewById(R.id.barcodeView);
         FrameLayout.LayoutParams barcodeLp = (FrameLayout.LayoutParams) barcodeView.getLayoutParams();
@@ -206,11 +221,20 @@ public class CameraActivity extends AppCompatActivity {
         stackLp.setMargins(0, 0, 0, 0);
         stackView.setLayoutParams(stackLp);
 
-        updateLayoutForPhase(false);
+        updateLayoutForPhase(isPlaybackPhase);
         timerHandler.post(timerRunnable);
 
         cameraExecutor = Executors.newSingleThreadExecutor();
         displayExecutor = Executors.newSingleThreadExecutor();
+
+        // For disk-based modes, reconstruct the barcode from previously persisted frames.
+        // Runs on displayExecutor so it doesn't block the camera thread; updateBarcode()
+        // skips until this finishes.
+        if (mode.useCompression) {
+            barcodeHistoryLoading = true;
+            displayExecutor.submit(this::initBarcodeFromHistory);
+        }
+
         initializeCamera();
     }
 
@@ -484,9 +508,20 @@ public class CameraActivity extends AppCompatActivity {
         if (barcodeDisplay2 != null && !barcodeDisplay2.isRecycled()) barcodeDisplay2.recycle();
         barcodeDisplay1 = null;
         barcodeDisplay2 = null;
+        if (moonBarcodeBuffer != null) {
+            for (Bitmap b : moonBarcodeBuffer) {
+                if (b != null && !b.isRecycled()) b.recycle();
+            }
+            moonBarcodeBuffer.clear();
+        }
     }
 
     private void updateBarcode(Bitmap thumb) {
+        if (barcodeHistoryLoading) return;
+        if (!mode.useCompression) {
+            updateMoonBarcode(thumb);
+            return;
+        }
         long nowMs = System.currentTimeMillis();
         if (lastBarcodeFrameMs == 0) {
             lastBarcodeFrameMs = nowMs;
@@ -542,6 +577,155 @@ public class CameraActivity extends AppCompatActivity {
 
         final Bitmap toPost = writeBmp;
         runOnUiThread(() -> barcodeView.setImageBitmap(toPost));
+    }
+
+    /**
+     * Moon-mode barcode: keep a rolling deque of thumbnail copies and redraw all frames
+     * as scaled tiles. Each of the maxMoonBarcodeFrames slots is a fixed-width column;
+     * oldest frame is at the left, newest at the right.
+     */
+    private void updateMoonBarcode(Bitmap thumb) {
+        Bitmap copy = thumb.copy(thumb.getConfig(), false);
+        moonBarcodeBuffer.addLast(copy);
+        while (moonBarcodeBuffer.size() > maxMoonBarcodeFrames) {
+            Bitmap old = moonBarcodeBuffer.pollFirst();
+            if (old != null && !old.isRecycled()) old.recycle();
+        }
+
+        Bitmap writeBmp = useBarcodeDisplay1 ? barcodeDisplay1 : barcodeDisplay2;
+        Canvas writeCanvas = useBarcodeDisplay1 ? barcodeCanvas1 : barcodeCanvas2;
+        useBarcodeDisplay1 = !useBarcodeDisplay1;
+
+        writeCanvas.drawColor(0xFF000000);
+
+        int slotW = barcodeW / maxMoonBarcodeFrames;
+        if (slotW < 1) slotW = 1;
+        int i = 0;
+        for (Bitmap frame : moonBarcodeBuffer) {
+            if (!frame.isRecycled()) {
+                int x = i * slotW;
+                int right = (i == maxMoonBarcodeFrames - 1) ? barcodeW : x + slotW;
+                writeCanvas.drawBitmap(frame, null, new Rect(x, 0, right, barcodeH), moonBarcodePaint);
+            }
+            i++;
+        }
+
+        final Bitmap toPost = writeBmp;
+        runOnUiThread(() -> barcodeView.setImageBitmap(toPost));
+    }
+
+    /**
+     * Reconstruct the barcode from previously persisted JPEG frames.
+     * Runs on displayExecutor. Maps each barcode pixel to the nearest saved frame by
+     * timestamp; leaves pixels black where no frame exists (gap while app was stopped).
+     * Syncs both double-buffer bitmaps so the first live updateBarcode() call doesn't
+     * flash the stale all-black buffer.
+     */
+    private void initBarcodeFromHistory() {
+        long[] timestamps = frameBuffer.getBufferedTimestamps();
+        File[] files = frameBuffer.getBufferedFiles();
+
+        if (files == null || files.length == 0) {
+            barcodeHistoryLoading = false;
+            return;
+        }
+
+        long nowMs = System.currentTimeMillis();
+        long totalMs = (long)(barcodeHistorySeconds * 1000);
+        long oldestMs = nowMs - totalMs;
+        // Accept a file as "covering" a pixel if it's within 3 pixel-widths of that pixel's time.
+        long tolerance = Math.max(1500L, totalMs * 3 / barcodeW);
+
+        Bitmap workBmp = Bitmap.createBitmap(barcodeW, barcodeH, Bitmap.Config.ARGB_8888);
+        workBmp.eraseColor(0xFF000000);
+
+        int lastFileIdx = -1;
+        int[] lastSlit = null;
+
+        for (int x = 0; x < barcodeW; x++) {
+            long targetMs = oldestMs + (long)((double)x / barcodeW * totalMs);
+            int idx = nearestTimestampIndex(timestamps, targetMs);
+            if (idx < 0) continue;
+            if (Math.abs(timestamps[idx] - targetMs) > tolerance) continue;
+
+            if (idx != lastFileIdx) {
+                lastSlit = decodeFileToSlit(files[idx]);
+                lastFileIdx = idx;
+            }
+            if (lastSlit != null) {
+                workBmp.setPixels(lastSlit, 0, 1, x, 0, 1, barcodeH);
+            }
+        }
+
+        // Sync both double-buffer bitmaps so neither has stale black data
+        barcodeCanvas1.drawBitmap(workBmp, 0f, 0f, null);
+        barcodeCanvas2.drawBitmap(workBmp, 0f, 0f, null);
+        workBmp.recycle();
+
+        useBarcodeDisplay1 = true;
+        barcodeFrameCount = barcodeW; // enter scrolling mode; new slits append at right edge
+
+        final Bitmap toPost = barcodeDisplay1;
+        runOnUiThread(() -> barcodeView.setImageBitmap(toPost));
+
+        barcodeHistoryLoading = false;
+    }
+
+    /**
+     * Decode a JPEG file at reduced resolution and return a column of averaged row colors
+     * suitable for stamping into the barcode as a single vertical slit.
+     * Scales the decoded image to miniW × miniH so the center-row extraction matches
+     * exactly what updateBarcode() does with live thumbnails.
+     */
+    private int[] decodeFileToSlit(java.io.File file) {
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inSampleSize = 8;
+        Bitmap decoded = BitmapFactory.decodeFile(file.getAbsolutePath(), opts);
+        if (decoded == null) return null;
+
+        // Scale to thumbnail dimensions so height is guaranteed >= miniH
+        Bitmap thumb = Bitmap.createScaledBitmap(decoded, miniW, miniH, true);
+        decoded.recycle();
+
+        // Extract center barcodeH rows — identical to updateBarcode()
+        int slitStartY = (miniH - barcodeH) / 2;
+        int[] scratch = new int[miniW * barcodeH];
+        thumb.getPixels(scratch, 0, miniW, 0, slitStartY, miniW, barcodeH);
+        thumb.recycle();
+
+        int[] slit = new int[barcodeH];
+        for (int row = 0; row < barcodeH; row++) {
+            long rSum = 0, gSum = 0, bSum = 0;
+            int base = row * miniW;
+            for (int col = 0; col < miniW; col++) {
+                int px = scratch[base + col];
+                rSum += (px >> 16) & 0xFF;
+                gSum += (px >> 8) & 0xFF;
+                bSum += px & 0xFF;
+            }
+            slit[row] = 0xFF000000 | ((int)(rSum / miniW) << 16) | ((int)(gSum / miniW) << 8) | (int)(bSum / miniW);
+        }
+        return slit;
+    }
+
+    /**
+     * Binary search returning the index of the element in {@code timestamps} whose value
+     * is closest to {@code targetMs}. Returns -1 if the array is empty.
+     */
+    private int nearestTimestampIndex(long[] timestamps, long targetMs) {
+        if (timestamps == null || timestamps.length == 0) return -1;
+        int lo = 0, hi = timestamps.length - 1;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (timestamps[mid] < targetMs) lo = mid + 1;
+            else hi = mid;
+        }
+        // lo is the first index >= targetMs; compare with lo-1 to find nearest
+        if (lo == 0) return 0;
+        if (lo >= timestamps.length) return timestamps.length - 1;
+        long diffLo = Math.abs(timestamps[lo] - targetMs);
+        long diffPrev = Math.abs(timestamps[lo - 1] - targetMs);
+        return diffLo <= diffPrev ? lo : lo - 1;
     }
 
     private void buildDisplayBitmap(Bitmap dst) {
