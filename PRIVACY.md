@@ -69,4 +69,4 @@ All image data captured by this app:
 
 ---
 
-*Copyright © 2025 Todd Margolis. All rights reserved. See [LICENSE](LICENSE) for terms.*
+*Copyright © 2025 Todd Margolis. All rights reserved. See [LICENSE](LICENSE.md) for terms.*
