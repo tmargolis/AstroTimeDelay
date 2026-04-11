@@ -1,6 +1,6 @@
 # Privacy
 
-*Cosmic Latency — Time-Delay Video Mirrors* is an artwork that uses a camera to reflect viewers back to themselves across time. That premise depends on trust: a person standing before the mirror must feel confident that their image exists only within the piece, not beyond it. This document describes the privacy commitments that make that trust warranted.
+*Delayed Vision - Cosmically Inspired Video Mirrors* is an artwork that uses a camera to reflect viewers back to themselves across time. That premise depends on trust: a person standing before the mirror must feel confident that their image exists only within the piece, not beyond it. This document describes the privacy commitments that make that trust warranted.
 
 ---
 
@@ -66,3 +66,7 @@ All image data captured by this app:
 - Is stored in an app-private location inaccessible to other apps
 - Is automatically deleted as the delay window advances
 - Is never transmitted, shared, or retained beyond its purpose within the artwork
+
+---
+
+*Copyright © 2025 Todd Margolis. All rights reserved. See [LICENSE](LICENSE) for terms.*

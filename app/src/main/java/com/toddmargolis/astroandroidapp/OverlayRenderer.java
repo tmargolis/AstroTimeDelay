@@ -1,3 +1,5 @@
+// Copyright (c) 2025 Todd Margolis. All rights reserved.
+// Delayed Vision - Cosmically Inspired Video Mirrors. See LICENSE for terms.
 package com.toddmargolis.astroandroidapp;
 
 import android.content.Context;

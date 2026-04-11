@@ -1,4 +1,4 @@
-# Cosmic Latency — Time-Delay Video Mirrors
+# Delayed Vision - Cosmically Inspired Video Mirrors
 
 *An installation by Todd Margolis*
 
@@ -181,3 +181,7 @@ com.toddmargolis.astroandroidapp/
 ```
 
 Requires Android SDK and a connected device or emulator running Android 8.0+ (API 26+). A physical device with a front-facing camera is required for full operation.
+
+---
+
+*Copyright © 2025 Todd Margolis. All rights reserved. Delayed Vision - Cosmically Inspired Video Mirrors — including its software, artistic concepts, and documentation — is proprietary. See [LICENSE](LICENSE) for terms.*
