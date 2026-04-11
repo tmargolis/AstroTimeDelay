@@ -42,73 +42,118 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * Main camera screen. Owns the full pipeline from live camera input to composited display.
+ *
+ * Pipeline summary:
+ *   1. CameraX ImageAnalysis delivers frames on cameraExecutor (single background thread).
+ *   2. FrameBuffer.addFrame() stores each frame (JPEG on disk or RAM) and returns a thumbnail.
+ *   3. The thumbnail feeds two parallel outputs:
+ *        a. EMA ghost stack — an exponential moving average composite of all thumbnails,
+ *           shown in the corner during playback or full-screen during queuing.
+ *        b. Movie barcode strip — a scrolling strip at the bottom showing recent frame history.
+ *   4. On a separate displayExecutor, getDelayedFrame() retrieves the oldest buffered frame
+ *      and OverlayRenderer composites it with the mode's tint and celestial overlay.
+ *
+ * Threading:
+ *   - cameraExecutor: camera frames + FrameBuffer writes + EMA stack + barcode updates
+ *   - displayExecutor: disk reads (getDelayedFrame), OverlayRenderer, history init
+ *   - Main thread: all UI updates (ImageView.setImageBitmap, label text, layout changes)
+ */
 public class CameraActivity extends AppCompatActivity {
     private static final String TAG = "CameraActivity";
 
-    private ImageView mainView;
-    private CelestialMode mode;
-    private FrameBuffer frameBuffer;
-    private OverlayRenderer renderer;
-    private ExecutorService cameraExecutor;
+    // -------------------------------------------------------------------------
+    // Core pipeline objects
+    // -------------------------------------------------------------------------
+    private ImageView mainView;           // full-screen view; shows ghost during queuing, delayed frame during playback
+    private CelestialMode mode;           // configuration for the selected celestial body
+    private FrameBuffer frameBuffer;      // stores frames and tracks timestamps
+    private OverlayRenderer renderer;     // composites tint + overlay onto delayed frames
+    private ExecutorService cameraExecutor;   // single thread for camera analysis callbacks
     private ProcessCameraProvider cameraProvider;
-    private TextView modeIndicator;
-    private TextView modeNameLabel;
-    private LinearLayout bottomLabelRow;
-    private TextView queuingLabel;
-    private long lastDisplayUpdateMs = 0;
-    private ExecutorService displayExecutor;
-    private ImageView countdownOverlayView;
+    private ExecutorService displayExecutor;  // single thread for disk-read display updates + history init
 
-    // Presence Detection and Screen Dimming
+    // -------------------------------------------------------------------------
+    // UI elements
+    // -------------------------------------------------------------------------
+    private TextView modeIndicator;       // bottom-left: countdown during queuing, timestamp during playback
+    private TextView modeNameLabel;       // top-center: mode name and delay (e.g. "Moon / 1.3 second delay")
+    private LinearLayout bottomLabelRow;
+    private TextView queuingLabel;        // large "QUEUEING" text shown while the buffer fills
+    private ImageView countdownOverlayView; // celestial overlay image shown during queuing phase
+    private long lastDisplayUpdateMs = 0; // tracks the last time the delayed frame was rendered
+
+    // -------------------------------------------------------------------------
+    // Presence detection and screen dimming
+    // -------------------------------------------------------------------------
     private long lastMovementTimeMs = System.currentTimeMillis();
     private boolean isDimmed = false;
-    private static final long INACTIVITY_TIMEOUT_MS = 30000; // 30 seconds for testing
+    private static final long INACTIVITY_TIMEOUT_MS = 30000; // dim after 30 seconds of no motion
     private static final float BRIGHT_LEVEL = 1.0f;
-    private static final float DIM_LEVEL = 0.05f;
+    private static final float DIM_LEVEL = 0.05f;          // 5% brightness when inactive
 
+    // -------------------------------------------------------------------------
+    // EMA ghost stack
+    // The stack accumulates every incoming thumbnail into a single composite image
+    // using an Exponential Moving Average: stack = stack*(1-α) + frame*α.
+    // stackFloat stores per-channel float values to avoid integer rounding errors
+    // across thousands of blends. buildDisplayBitmap() converts to pixels for display.
+    // -------------------------------------------------------------------------
     private volatile boolean isPlaybackPhase = false;
-    private ImageView stackView;
-    private float[] stackFloat;
-    private Bitmap stackDisplay1, stackDisplay2;
+    private ImageView stackView;          // bottom-right corner preview (visible during playback only)
+    private float[] stackFloat;           // per-pixel RGB float accumulator [miniW * miniH * 3]
+    private Bitmap stackDisplay1, stackDisplay2; // double-buffered display bitmaps
     private boolean useDisplay1 = true;
-    private int[] stackPixels;
-    private float emaFade;
-    private float emaAdd;
-    private final float[] powCurve = new float[256];
-    private int miniW, miniH;
+    private int[] stackPixels;            // scratch int[] for setPixels() / getPixels() calls
+    private float emaFade;                // per-update fade factor: (1 - boostedAlpha)^emaUpdateEvery
+    private float emaAdd;                 // per-update add weight: emaUpdateEvery * boostedAlpha
+    private final float[] powCurve = new float[256]; // gamma lookup: maps [0,255] → perceptual brightness
+    private int miniW, miniH;             // ghost stack / thumbnail dimensions (screenW/4, 16:9)
     private boolean stackInitialized = false;
-    private int emaUpdateEvery = 1;
+    private int emaUpdateEvery = 1;       // batch N frames per EMA update (needed when alpha < 1/255)
     private int emaFrameCounter = 0;
 
+    // -------------------------------------------------------------------------
+    // Movie barcode strip
+    // Full-width strip at the bottom showing a scrolling slit-scan of recent frames.
+    // Sun/Saturn/Proxima: each slit is the average color of one stored frame (1px wide).
+    // Moon: each slit is a fixed-width (moonBarcodeSlitWidth px) thumbnail crop.
+    // Double-buffered: one bitmap is displayed while the other is being drawn to.
+    // -------------------------------------------------------------------------
     private ImageView barcodeView;
-    private ImageView tickView;
-    private int barcodeW, barcodeH;
-    private float barcodeAccum = 0f;
-    private long lastBarcodeFrameMs = 0;
-    private volatile int barcodeFrameCount = 0;
+    private ImageView tickView;           // fixed tick marks drawn over the barcode (separate layer, non-scrolling)
+    private int barcodeW, barcodeH;       // barcode strip dimensions in pixels
+    private float barcodeAccum = 0f;      // fractional pixel accumulator for time-proportional slit placement
+    private long lastBarcodeFrameMs = 0;  // wall-clock time of the last barcode update
+    private volatile int barcodeFrameCount = 0; // pixels filled so far (fills left→right, then scrolls)
     private Bitmap barcodeDisplay1, barcodeDisplay2;
     private Canvas barcodeCanvas1, barcodeCanvas2;
     private volatile boolean useBarcodeDisplay1 = true;
-    private int[] slitPixels;
-    private int[] rowAvgScratch;
-    private float barcodeHistorySeconds;
-    private volatile boolean barcodeHistoryLoading = false;
-    private volatile boolean emaHistoryLoading = false;
+    private int[] slitPixels;             // scratch column of averaged pixels for Sun/Saturn slit rendering
+    private int[] rowAvgScratch;          // scratch pixel array for row-averaging across miniW
+    private float barcodeHistorySeconds;  // seconds of history the full barcode width represents
+    private volatile boolean barcodeHistoryLoading = false; // true while initBarcodeFromHistory() runs
+    private volatile boolean emaHistoryLoading = false;     // true while initEmaFromHistory() runs
 
-    // Moon-mode barcode: thumbnail copies of each buffered frame, drawn as scaled tiles
+    // Moon-mode barcode: legacy tile buffer (used when useCompression=false; retained for RAM-mode fallback)
     private ArrayDeque<Bitmap> moonBarcodeBuffer;
     private int maxMoonBarcodeFrames;
     private Paint moonBarcodePaint;
-    private int moonBarcodeSlitWidth; // fixed px width per frame; keeps all slits equal-sized
+    private int moonBarcodeSlitWidth; // fixed pixel width per Moon barcode frame; all slits equal-sized
 
-    // Buffer-clear gesture: 10 taps in the top-right corner within 5 seconds
+    // -------------------------------------------------------------------------
+    // Secret buffer-clear gesture: tap the top-right corner 10 times within 5 seconds.
+    // Useful for resetting a session during installation or testing without going
+    // through the mode selection screen.
+    // -------------------------------------------------------------------------
     private int clearTapCount = 0;
     private long clearTapWindowStartMs = 0;
     private static final int CLEAR_TAP_TARGET = 10;
     private static final long CLEAR_TAP_WINDOW_MS = 5000;
     private int screenW;
 
-    // Checkpoint support
+    // Checkpoint key constants (used for SharedPreferences — currently just for logging)
     private static final String PREFS_NAME = "AstroTimeDelayPrefs";
     private static final String CHECKPOINT_KEY_PREFIX = "checkpoint_";
     
@@ -154,8 +199,14 @@ public class CameraActivity extends AppCompatActivity {
         DisplayMetrics dm = new DisplayMetrics();
         getWindowManager().getDefaultDisplay().getMetrics(dm);
         screenW = dm.widthPixels;
+
+        // Ghost stack / thumbnail size: ¼ of screen width at 16:9 aspect ratio.
+        // All thumbnails returned by FrameBuffer.addFrame() use these dimensions.
         miniW = dm.widthPixels / 4;
         miniH = miniW * 9 / 16;
+
+        // Corner preview (stackView) is slightly shorter than the full 16:9 mini, giving
+        // a 4:3-ish crop that fits tidily in the bottom-right without covering the barcode label.
         int cornerH = miniH * 3 / 4;
         int cornerW = cornerH * 16 / 9;
 
@@ -201,21 +252,42 @@ public class CameraActivity extends AppCompatActivity {
         stackPixels = new int[miniW * miniH];
 
         float emaAlpha = frameBuffer.getEmaAlpha();
+
+        // When emaAlpha is below 1/255, a single blend step rounds to zero and the stack
+        // never visibly changes. Fix: batch emaUpdateEvery frames into one update, using
+        // an effective alpha of (emaAlpha * emaUpdateEvery) so the blend stays visible.
         emaUpdateEvery = Math.max(1, (int)Math.ceil(1.0 / (emaAlpha * 255)));
+
+        // Boost alpha by 2× to compensate for the gamma curve below — without this boost
+        // the stack looks darker than expected because powCurve compresses bright values.
         float boostedAlpha = Math.min(0.99f, emaAlpha * 2.0f);
+
+        // Pre-compute the per-update fade and add weights for the batched EMA formula:
+        //   stack = stack * emaFade + newFrame * emaAdd
+        // These are applied once every emaUpdateEvery frames rather than per frame.
         emaFade = (float)Math.pow(1.0 - boostedAlpha, emaUpdateEvery);
         emaAdd  = emaUpdateEvery * boostedAlpha;
 
+        // Gamma correction lookup table (power 0.8 ≈ slight gamma expansion).
+        // Applying this to incoming pixel values before EMA blending makes the ghost
+        // stack appear perceptually brighter and more natural on the tablet display.
         for (int i = 0; i < 256; i++) {
             powCurve[i] = (float) (Math.pow(i / 255.0, 0.8) * 255.0);
         }
 
-        barcodeW = dm.widthPixels;
-        barcodeH = 120; // fills the 120px gap below the 16:9 ghost on Tab A9+ (1920×1200 screen)
-        // Use the mode's declared barcode window, or fall back to delaySeconds.
+        barcodeW = dm.widthPixels; // barcode spans the full screen width
+        // The Samsung Galaxy Tab A9+ has a 1920×1200 screen. At 16:9, the ghost fills
+        // 1920×1080, leaving exactly 120px at the bottom — the barcode fills that gap.
+        barcodeH = 120;
+
+        // Use the mode's declared barcode window if set, otherwise use the delay.
+        // Moon overrides this to 10s so the barcode shows 10s of history rather than 1.3s.
         barcodeHistorySeconds = mode.barcodeHistorySeconds > 0 ? mode.barcodeHistorySeconds : mode.delaySeconds;
-        // Fixed slit width for Moon: barcodeW / (window * 6fps) ≈ 32px at 1920/10s/6fps.
-        // Using 6fps as the target display rate regardless of bufferFps.
+
+        // Moon barcode slit width: divide the full barcode into equal-width slots at ~6fps.
+        // At 1920px / 10s / 6fps ≈ 32px per frame — wide enough to see the thumbnail image.
+        // Using 6fps (not bufferFps=8) because updateBarcode() is called on stored frames
+        // only, and frameSkip means actual call rate is ~4–6fps in practice.
         moonBarcodeSlitWidth = Math.max(1, (int)(barcodeW / barcodeHistorySeconds / 6));
 
         int ghostDisplayH = screenW * 9 / 16;
@@ -301,8 +373,13 @@ public class CameraActivity extends AppCompatActivity {
         initializeCamera();
     }
 
+    /**
+     * Resets all buffer and display state as if the app was freshly launched.
+     * Triggered by the secret 10-tap gesture on the top-right corner.
+     * Also called if the user wants to restart the delay from the current moment.
+     */
     private void triggerClear() {
-        frameBuffer.clearAllFrames();
+        frameBuffer.clearAllFrames();   // deletes JPEG files and resets timestamps
         isPlaybackPhase = false;
         lastDisplayUpdateMs = 0;
         stackInitialized = false;
@@ -353,20 +430,31 @@ public class CameraActivity extends AppCompatActivity {
         });
     }
 
+    /**
+     * Called every 100ms by timerRunnable (main thread).
+     * Drives the phase transition from QUEUEING to PLAYBACK and updates the bottom label:
+     *   - QUEUEING: shows a live countdown to when the buffer will be full.
+     *   - PLAYBACK: shows the exact capture timestamp of the frame currently on screen.
+     */
     private void updateTimeLabel() {
         long firstFrameMs = frameBuffer.getFirstFrameTimeMs();
         float elapsedSecs = (firstFrameMs == 0) ? 0 : (System.currentTimeMillis() - firstFrameMs) / 1000f;
+
+        // Transition to playback once elapsed time exceeds the mode's delay.
         boolean nowPlayback = (firstFrameMs != 0 && elapsedSecs >= mode.delaySeconds);
         if (nowPlayback != isPlaybackPhase) {
             isPlaybackPhase = nowPlayback;
             updateLayoutForPhase(isPlaybackPhase);
         }
+
         if (!nowPlayback) {
+            // Show countdown: how many seconds remain before the buffer is full.
             int remaining = (firstFrameMs == 0) ? (int) mode.delaySeconds : (int)(mode.delaySeconds - elapsedSecs);
             modeIndicator.setText(formatCountdown(remaining));
             queuingLabel.setVisibility(View.VISIBLE);
         } else {
             queuingLabel.setVisibility(View.GONE);
+            // Show the capture timestamp of the frame currently at the head of the buffer.
             long frameTimeMs = frameBuffer.getCurrentFrameTimestamp();
             if (frameTimeMs > 0) {
                 Calendar cal = Calendar.getInstance();
@@ -378,7 +466,8 @@ public class CameraActivity extends AppCompatActivity {
                 int m     = cal.get(Calendar.MINUTE);
                 int s     = cal.get(Calendar.SECOND);
                 int ms    = cal.get(Calendar.MILLISECOND);
-                modeIndicator.setText(String.format("Playback from %02d/%02d/%04d %02d:%02d:%02d.%03d", month, day, year, h, m, s, ms));
+                modeIndicator.setText(String.format("Playback from %02d/%02d/%04d %02d:%02d:%02d.%03d",
+                        month, day, year, h, m, s, ms));
             }
         }
     }
@@ -508,25 +597,35 @@ public class CameraActivity extends AppCompatActivity {
             @Override
             public void analyze(@NonNull ImageProxy imageProxy) {
                 long nowMs = System.currentTimeMillis();
+
+                // Throttle the display update to mode.displayIntervalMs (e.g. 250ms for Sun).
+                // Disk modes offload the decode + composite to displayExecutor so the camera
+                // thread isn't blocked waiting for JPEG I/O. RAM modes (Moon) composite inline.
                 if (isPlaybackPhase && nowMs - lastDisplayUpdateMs >= mode.displayIntervalMs) {
                     lastDisplayUpdateMs = nowMs;
                     if (mode.useCompression) {
                         displayExecutor.submit(() -> {
                             Bitmap delayedFrame = frameBuffer.getDelayedFrame();
                             if (delayedFrame != null) {
+                                // Fade the overlay from prominent (alpha ~1.0) to subtle (alpha ~0.5)
+                                // as the buffer fills. The log10 curve makes the fade fast at first
+                                // then plateau — so the overlay is clearly visible early on but
+                                // doesn't overwhelm the delayed reflection once the buffer is full.
                                 float historyProgress = 0f;
                                 long firstMs = frameBuffer.getFirstFrameTimeMs();
                                 if (firstMs > 0) {
                                     float elapsed = (System.currentTimeMillis() - firstMs) / 1000f;
                                     historyProgress = Math.min(1.0f, elapsed / mode.delaySeconds);
                                 }
-                                float baseline = 0.5f;
-                                float dynamicAlpha = baseline + (1.0f - baseline) * (1.0f - (float)Math.log10(1.0 + 9.0 * historyProgress));
+                                float baseline = 0.5f; // minimum overlay alpha at full buffer
+                                float dynamicAlpha = baseline + (1.0f - baseline)
+                                        * (1.0f - (float)Math.log10(1.0 + 9.0 * historyProgress));
                                 Bitmap composited = renderer.renderFrame(delayedFrame, dynamicAlpha);
                                 runOnUiThread(() -> mainView.setImageBitmap(composited));
                             }
                         });
                     } else {
+                        // RAM mode (Moon): composite inline on camera thread (no disk I/O).
                         Bitmap delayedFrame = frameBuffer.getDelayedFrame();
                         if (delayedFrame != null) {
                             Bitmap composited = renderer.renderFrame(delayedFrame, 0.5f);
@@ -535,62 +634,67 @@ public class CameraActivity extends AppCompatActivity {
                     }
                 }
 
+                // Store the frame (or skip it based on frameSkip) and get back a thumbnail.
+                // Returns null for skipped frames, so everything below only runs on stored frames.
                 Bitmap thumb = frameBuffer.addFrame(imageProxy);
 
-                // Check for motion detection and handle screen dimming
                 if (thumb != null) {
+                    // Motion detection drives screen dimming: if motion is seen, wake the screen
+                    // immediately; if no motion for INACTIVITY_TIMEOUT_MS, dim to save power.
                     boolean motionDetected = frameBuffer.isMotionDetected();
                     float motionScore = frameBuffer.getLastMotionScore();
-                    
-                    // Log motion detection results (optional - can be removed)
                     if (motionDetected) {
-                        Log.d(TAG, "Motion detected! Score: " + String.format("%.3f", motionScore));
-                        lastMovementTimeMs = nowMs;  // Update the last movement time when motion is detected
-                        updateScreenBrightness(false); // Wake up immediately on motion
-                    } else if (nowMs - lastMovementTimeMs > INACTIVITY_TIMEOUT_MS) {
-                        // NO MOVEMENT FOR INACTIVITY_TIMEOUT_MS
-                        // Only dim if we're not already dimmed
-                        if (!isDimmed) {
-                            updateScreenBrightness(true); // Dim if timeout reached
-                        }
+                        Log.d(TAG, "Motion detected: score=" + String.format("%.3f", motionScore));
+                        lastMovementTimeMs = nowMs;
+                        updateScreenBrightness(false); // wake immediately on motion
+                    } else if (!isDimmed && nowMs - lastMovementTimeMs > INACTIVITY_TIMEOUT_MS) {
+                        updateScreenBrightness(true); // dim after inactivity timeout
                     }
 
+                    // Update the barcode strip with the new thumbnail.
                     updateBarcode(thumb);
 
+                    // EMA ghost stack update — blocked while initEmaFromHistory() is running
+                    // so history frames and live frames don't intermix mid-replay.
                     if (!emaHistoryLoading) {
-                    emaFrameCounter++;
-                    if (!stackInitialized) {
-                        thumb.getPixels(stackPixels, 0, miniW, 0, 0, miniW, miniH);
-                        for (int i = 0; i < miniW * miniH; i++) {
-                            int p = stackPixels[i];
-                            int base = i * 3;
-                            stackFloat[base]     = powCurve[(p >> 16) & 0xFF];
-                            stackFloat[base + 1] = powCurve[(p >> 8)  & 0xFF];
-                            stackFloat[base + 2] = powCurve[ p        & 0xFF];
+                        emaFrameCounter++;
+
+                        if (!stackInitialized) {
+                            // First frame: seed the entire stack with this thumbnail at full opacity.
+                            // This ensures the ghost is immediately visible rather than fading in
+                            // from black over many frames.
+                            thumb.getPixels(stackPixels, 0, miniW, 0, 0, miniW, miniH);
+                            for (int i = 0; i < miniW * miniH; i++) {
+                                int p = stackPixels[i];
+                                int base = i * 3;
+                                stackFloat[base]     = powCurve[(p >> 16) & 0xFF];
+                                stackFloat[base + 1] = powCurve[(p >> 8)  & 0xFF];
+                                stackFloat[base + 2] = powCurve[ p        & 0xFF];
+                            }
+                            stackInitialized = true;
+                            emaFrameCounter = 0;
+                            Bitmap posted = useDisplay1 ? stackDisplay1 : stackDisplay2;
+                            useDisplay1 = !useDisplay1;
+                            buildDisplayBitmap(posted);
+                            postEmaFrame(posted);
+
+                        } else if (emaFrameCounter >= emaUpdateEvery) {
+                            // Batch update: blend emaUpdateEvery frames worth of alpha in one step.
+                            // See emaFade/emaAdd initialization in onCreate for the math.
+                            emaFrameCounter = 0;
+                            thumb.getPixels(stackPixels, 0, miniW, 0, 0, miniW, miniH);
+                            for (int i = 0; i < miniW * miniH; i++) {
+                                int p = stackPixels[i];
+                                int base = i * 3;
+                                stackFloat[base]     = emaFade * stackFloat[base]     + emaAdd * powCurve[(p >> 16) & 0xFF];
+                                stackFloat[base + 1] = emaFade * stackFloat[base + 1] + emaAdd * powCurve[(p >> 8)  & 0xFF];
+                                stackFloat[base + 2] = emaFade * stackFloat[base + 2] + emaAdd * powCurve[ p        & 0xFF];
+                            }
+                            Bitmap posted = useDisplay1 ? stackDisplay1 : stackDisplay2;
+                            useDisplay1 = !useDisplay1;
+                            buildDisplayBitmap(posted);
+                            postEmaFrame(posted);
                         }
-                        stackInitialized = true;
-                        emaFrameCounter = 0;
-                        Bitmap posted = useDisplay1 ? stackDisplay1 : stackDisplay2;
-                        useDisplay1 = !useDisplay1;
-                        buildDisplayBitmap(posted);
-                        final Bitmap toPost = posted;
-                        postEmaFrame(toPost);
-                    } else if (emaFrameCounter >= emaUpdateEvery) {
-                        emaFrameCounter = 0;
-                        thumb.getPixels(stackPixels, 0, miniW, 0, 0, miniW, miniH);
-                        for (int i = 0; i < miniW * miniH; i++) {
-                            int p = stackPixels[i];
-                            int base = i * 3;
-                            stackFloat[base]     = emaFade * stackFloat[base]     + emaAdd * powCurve[(p >> 16) & 0xFF];
-                            stackFloat[base + 1] = emaFade * stackFloat[base + 1] + emaAdd * powCurve[(p >> 8)  & 0xFF];
-                            stackFloat[base + 2] = emaFade * stackFloat[base + 2] + emaAdd * powCurve[ p        & 0xFF];
-                        }
-                        Bitmap posted = useDisplay1 ? stackDisplay1 : stackDisplay2;
-                        useDisplay1 = !useDisplay1;
-                        buildDisplayBitmap(posted);
-                        final Bitmap toPost = posted;
-                        postEmaFrame(toPost);
-                    }
                     } // end !emaHistoryLoading
 
                     thumb.recycle();
@@ -657,6 +761,20 @@ public class CameraActivity extends AppCompatActivity {
         }
     }
 
+    /**
+     * Updates the movie barcode strip with the latest thumbnail.
+     *
+     * The barcode is a time-proportional slit-scan: each call advances the barcode by
+     * however many pixels correspond to the elapsed wall-clock time since the last call,
+     * relative to barcodeHistorySeconds. A fractional accumulator (barcodeAccum) carries
+     * sub-pixel remainders between calls so the total traversal time is always accurate.
+     *
+     * Routing:
+     *   - Proxima Centauri: updateProximaBarcode() — 5-row year grid
+     *   - Moon (disk): time-proportional fixed-width thumbnail tiles (below)
+     *   - Moon (RAM fallback): updateMoonBarcode() — legacy tile buffer
+     *   - Sun / Saturn: time-proportional single-pixel averaged-color slits (below)
+     */
     private void updateBarcode(Bitmap thumb) {
         if (barcodeHistoryLoading) return;
         if (!mode.useCompression) {
@@ -667,32 +785,39 @@ public class CameraActivity extends AppCompatActivity {
             updateProximaBarcode(thumb);
             return;
         }
+
         long nowMs = System.currentTimeMillis();
         if (lastBarcodeFrameMs == 0) {
             lastBarcodeFrameMs = nowMs;
-            return;
+            return; // first frame — nothing to draw yet
         }
         float dtSec = (nowMs - lastBarcodeFrameMs) / 1000f;
         lastBarcodeFrameMs = nowMs;
 
+        // Accumulate fractional pixels. barcodeAccum grows by (dtSec / window * width) per call,
+        // so the barcode takes exactly barcodeHistorySeconds to fill from left to right.
         barcodeAccum += dtSec / barcodeHistorySeconds * barcodeW;
 
-        // Moon: accumulate until we have at least one fixed-width slit. Consume all
-        // complete slits at once so the barcode catches up correctly when updateBarcode
-        // is called less frequently than bufferFps (e.g. frameSkip reduces call rate).
+        // Moon: dispatch exactly numMoonSlits fixed-width tiles this call, consuming
+        // each slit's worth of accumulator. When updateBarcode() is called less frequently
+        // than intended (e.g. due to frameSkip), numMoonSlits > 1 and the same thumbnail
+        // is drawn multiple times — "repeating the previous frame" for the missed slots.
         int numMoonSlits = 0;
         if (mode.name.equals("Moon")) {
             numMoonSlits = (int)(barcodeAccum / moonBarcodeSlitWidth);
-            if (numMoonSlits == 0) return;
+            if (numMoonSlits == 0) return; // not enough time has elapsed for a full slit yet
             barcodeAccum -= numMoonSlits * moonBarcodeSlitWidth;
         }
 
+        // Sun / Saturn: how many 1-pixel slits to draw this call.
         int slitsToDraw = (int)barcodeAccum;
         if (!mode.name.equals("Moon")) {
             if (slitsToDraw <= 0) return;
             barcodeAccum -= slitsToDraw;
         }
 
+        // Sun / Saturn: compute the average color of each row in the center barcodeH rows
+        // of the thumbnail, producing one pixel column to stamp into the barcode.
         if (!mode.name.equals("Moon")) {
             int slitStartY = (miniH - barcodeH) / 2;
             thumb.getPixels(rowAvgScratch, 0, miniW, 0, slitStartY, miniW, barcodeH);
@@ -705,7 +830,11 @@ public class CameraActivity extends AppCompatActivity {
                     gSum += (px >> 8) & 0xFF;
                     bSum += px & 0xFF;
                 }
-                slitPixels[row] = 0xFF000000 | ((int)(rSum / miniW) << 16) | ((int)(gSum / miniW) << 8) | (int)(bSum / miniW);
+                // Pack averaged RGB back into a packed int pixel
+                slitPixels[row] = 0xFF000000
+                        | ((int)(rSum / miniW) << 16)
+                        | ((int)(gSum / miniW) << 8)
+                        | (int)(bSum / miniW);
             }
         }
 
@@ -1099,6 +1228,11 @@ public class CameraActivity extends AppCompatActivity {
         return diffLo <= diffPrev ? lo : lo - 1;
     }
 
+    /**
+     * Converts the float EMA accumulator (stackFloat) into displayable pixels (stackPixels)
+     * and writes them into the destination bitmap.
+     * Clamps each channel to [0,255] to handle floating-point overshoot from the EMA add step.
+     */
     private void buildDisplayBitmap(Bitmap dst) {
         for (int i = 0; i < miniW * miniH; i++) {
             int base = i * 3;
@@ -1111,51 +1245,34 @@ public class CameraActivity extends AppCompatActivity {
     }
     
     /**
-     * Save the current state for recovery from crashes or app stops
+     * Called from onDestroy() for disk-based modes.
+     * FrameBuffer already saves a checkpoint file after every stored frame (inside
+     * addFrameToDisk → saveCheckpoint()), so there is nothing additional to persist here.
+     * This method exists as a clear hook in case future modes need explicit save logic.
      */
     private void saveState() {
-        if (mode.useCompression) {
-            // For disk-based modes (Sun/Saturn), the frames are already being saved
-            // The system handles eviction and persistence automatically by design
-            Log.d(TAG, "Saved checkpoint state for mode: " + mode.name);
-            
-            // Save timestamp to checkpoint file - this is handled automatically 
-            // by the FrameBuffer's saveCheckpoint() method called during frame storage
-        }
+        Log.d(TAG, "saveState called for mode: " + mode.name
+                + " (FrameBuffer handles checkpoint automatically)");
     }
-    
+
     /**
-     * Restore state from previous session if available
+     * Called from onCreate() for disk-based modes, after FrameBuffer is constructed.
+     * FrameBuffer.restoreFromExistingSession() has already reloaded the JPEG files and
+     * set firstFrameTimeMs from the checkpoint. This method reads that checkpoint timestamp
+     * to determine whether the buffer is already full (i.e. we should start in playback phase).
      */
     private void restoreState() {
-        if (mode.useCompression) {
-            // For disk-based modes, check if there are existing files to determine 
-            // if we can continue from previous buffer state
-            Log.d(TAG, "Restoring checkpoint state for mode: " + mode.name);
-            
-            // The system will naturally handle persistence based on file timestamps
-            // We don't need complex recovery logic - the file system automatically
-            // manages eviction and continues from where it left off.
-            // The only thing we check is if the session exists and has data
-            
-            long checkpointTimestamp = frameBuffer.getCheckpointTimestamp();
-            if (checkpointTimestamp > 0) {
-                Log.d(TAG, "Found existing checkpoint with timestamp: " + checkpointTimestamp);
-                // The system will continue normally from this point
-                // All frames are automatically managed by timestamp-based eviction
-                
-                // Force a UI update to reflect playback state if needed
-                long currentTime = System.currentTimeMillis();
-                float elapsedSecs = (currentTime - checkpointTimestamp) / 1000f;
-                boolean shouldPlayback = elapsedSecs >= mode.delaySeconds;
-                
-                if (shouldPlayback) {
-                    isPlaybackPhase = true;
-                    Log.d(TAG, "Forced playback phase due to restored checkpoint");
-                }
-            } else {
-                Log.d(TAG, "No existing checkpoint found - starting fresh session");
+        long checkpointTimestamp = frameBuffer.getCheckpointTimestamp();
+        if (checkpointTimestamp > 0) {
+            Log.d(TAG, "Restored checkpoint timestamp: " + checkpointTimestamp);
+            float elapsedSecs = (System.currentTimeMillis() - checkpointTimestamp) / 1000f;
+            if (elapsedSecs >= mode.delaySeconds) {
+                // Buffer was already full before the app was killed — start in playback immediately.
+                isPlaybackPhase = true;
+                Log.d(TAG, "Resuming in playback phase (delay already elapsed)");
             }
+        } else {
+            Log.d(TAG, "No checkpoint found — starting fresh session");
         }
     }
 }

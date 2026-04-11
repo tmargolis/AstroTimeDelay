@@ -12,8 +12,19 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
+/**
+ * Mode selection screen. Presents four buttons — one per celestial body — and routes
+ * to CameraActivity with the selected mode name as an Intent extra.
+ *
+ * Camera permission is requested here (on first use) rather than in CameraActivity so
+ * the permission dialog appears before the full-screen camera view opens.
+ */
 public class MainActivity extends AppCompatActivity {
+
+    // Arbitrary request code used to match the permission result callback below.
     private static final int CAMERA_PERMISSION_CODE = 100;
+
+    // Stores which mode button was tapped so it's available in the permission callback.
     private String selectedMode = "";
 
     @Override
@@ -21,11 +32,14 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        Button moonButton = findViewById(R.id.moonButton);
-        Button sunButton = findViewById(R.id.sunButton);
-        Button saturnButton = findViewById(R.id.saturnButton);
+        Button moonButton    = findViewById(R.id.moonButton);
+        Button sunButton     = findViewById(R.id.sunButton);
+        Button saturnButton  = findViewById(R.id.saturnButton);
         Button proximaButton = findViewById(R.id.proximaButton);
 
+        // Each button records the mode string and then triggers the permission check.
+        // The mode string is passed to CameraActivity via the "MODE" Intent extra and
+        // mapped to a CelestialMode factory method there.
         moonButton.setOnClickListener(v -> {
             selectedMode = "MOON";
             checkCameraPermission();
@@ -47,6 +61,10 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
+    /**
+     * If camera permission is already granted, launch CameraActivity immediately.
+     * Otherwise request it; the result is handled in onRequestPermissionsResult().
+     */
     private void checkCameraPermission() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) {
@@ -70,6 +88,7 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    /** Start CameraActivity with the selected mode passed as a string extra. */
     private void launchCameraActivity() {
         Intent intent = new Intent(this, CameraActivity.class);
         intent.putExtra("MODE", selectedMode);

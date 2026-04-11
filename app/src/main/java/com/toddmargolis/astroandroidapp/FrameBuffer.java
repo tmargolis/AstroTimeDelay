@@ -22,90 +22,156 @@ import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 
+/**
+ * Stores time-delayed camera frames and provides the oldest frame on demand.
+ *
+ * Each mode uses one of two storage strategies:
+ *   - RAM (useCompression=false): raw Bitmaps in an ArrayDeque, evicted by timestamp.
+ *     Only used as a fallback; all current modes use disk storage.
+ *   - Disk (useCompression=true): JPEG files in app-private external storage, one file
+ *     per stored frame, evicted when older than mode.delaySeconds. Using getExternalFilesDir()
+ *     instead of MediaStore avoids the media scanner, which caused multi-minute freezes
+ *     when thousands of buffer files triggered a scanner backlog at mode transitions.
+ *
+ * Proxima Centauri is a special case: storageIntervalMs > 0 activates a separate path
+ * (handleProximaFrame) that samples at 1fps, scores each second for motion, and promotes
+ * only the highest-motion frame from each 4-hour window to a permanent file.
+ *
+ * Session persistence: on construction, any existing session directory for the current
+ * mode is found and its files are reloaded into the buffer, so the delay continues across
+ * app restarts without losing the accumulated history.
+ *
+ * Threading: addFrame() runs on the camera thread; getDelayedFrame() runs on the display
+ * thread. Shared state (fileBuffer, diskTimestampBuffer, motion fields) is guarded by
+ * synchronized blocks.
+ */
 public class FrameBuffer {
     private static final String TAG = "FrameBuffer";
+
+    /** JPEG compression quality for all stored frames. 60% gives good visual quality at
+     *  roughly ⅓ the file size of a raw bitmap — acceptable for a time-delay art installation. */
     private static final int JPEG_QUALITY = 60;
 
-    // Proxima Centauri: sample rate for motion scoring
+    // Proxima Centauri: sample rate for the motion-scoring pipeline
     private static final long PROXIMA_SAMPLE_INTERVAL_MS = 1000L; // 1 sample per second
 
-    // Motion detection constants
+    // Motion detection thresholds.
+    // LUMA_DELTA_THRESHOLD: a pixel is "changed" if its luma shifts by more than this (0–255 scale).
+    //   18 ≈ 7% of full range — ignores minor noise/compression artefacts while catching real motion.
+    // MOTION_FRACTION_THRESHOLD: motion is "detected" when this fraction of pixels changed.
+    //   0.005 = 0.5% of pixels — sensitive enough to catch a person entering frame.
     private static final int LUMA_DELTA_THRESHOLD = 18;
     private static final float MOTION_FRACTION_THRESHOLD = 0.005f;
 
     private final CelestialMode mode;
-    // private final Context context; // Not used, can be removed
 
-    // Thumbnail dimensions for the EMA mini-view
+    // Thumbnail dimensions passed in from CameraActivity (screenW/4, 16:9).
+    // All thumbnails returned by addFrame() use these dimensions.
     private final int thumbW;
     private final int thumbH;
-    private final float emaAlpha;
+    private final float emaAlpha; // passed through to CameraActivity for EMA stack init
 
-    // RAM path (Moon)
+    // -------------------------------------------------------------------------
+    // RAM storage path (fallback — not used by any current mode)
+    // -------------------------------------------------------------------------
     private ArrayDeque<Bitmap> bitmapBuffer;
     private ArrayDeque<Long> timestampBuffer;
 
-    // Disk path (Sun, Saturn) — stored as JPEG files in app-private external storage.
-    // Using getExternalFilesDir() avoids the MediaStore media scanner, which caused a
-    // ~1-minute freeze when 7,500+ buffer files triggered scanner backlog at mode transition.
-    private ArrayDeque<File> fileBuffer;
-    private ArrayDeque<Long> diskTimestampBuffer;
-    private File sessionDir;
-    // Cache the last decoded frame so we only hit disk when the buffer head actually advances
+    // -------------------------------------------------------------------------
+    // Disk storage path (Sun, Saturn, Moon, Proxima Centauri)
+    // -------------------------------------------------------------------------
+    private ArrayDeque<File> fileBuffer;           // JPEG files in chronological order
+    private ArrayDeque<Long> diskTimestampBuffer;  // capture timestamps matching fileBuffer
+    private File sessionDir;   // e.g. AstroTimeDelay/Moon_2025-04-11_10-00-00/
+
+    // Decoded-frame cache: avoids re-decoding the same JPEG on every display thread tick.
+    // Only invalidated when fileBuffer.peek() advances to a new file.
     private Bitmap cachedFrame;
     private File cachedFile;
-    
-    private Bitmap lastStoredThumb; // Copy of the most recently stored frame's thumbnail
 
-    // Motion detection state
-    private Bitmap previousThumb;
+    private Bitmap lastStoredThumb; // deep copy of the most recent stored frame's thumbnail,
+                                    // used by getLatestThumbnail() for presence detection
+
+    // -------------------------------------------------------------------------
+    // Motion detection state (updated on every stored frame; read by CameraActivity)
+    // -------------------------------------------------------------------------
+    private Bitmap previousThumb;          // thumbnail from the prior stored frame
     private boolean motionDetected = false;
     private float lastMotionScore = 0.0f;
 
+    // Date format for session directory names (human-readable, filesystem-safe).
     private static final SimpleDateFormat FOLDER_FMT =
             new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US);
+
+    // Date format for individual frame filenames. Used both when writing (addFrameToDisk,
+    // writeProximaCandidate) and when reading back (extractTimestampFromFile).
+    // Must sort lexicographically in chronological order — this format does.
     private static final SimpleDateFormat FILE_FMT =
             new SimpleDateFormat("yyyy.MM.dd.HH.mm.ss.SSS", Locale.US);
 
-    private volatile boolean released = false; // set before bitmaps are recycled
+    private volatile boolean released = false; // set in release() to stop addFrame() ASAP
 
-    private int frameSkip;      // store 1 out of every N incoming frames
+    // frameSkip: store 1 out of every N camera frames (N = targetFps / bufferFps).
+    // skipCounter: counts frames since last stored frame.
+    private int frameSkip;
     private int skipCounter = 0;
-    private long frameCount = 0;
-    private long firstFrameTimeMs = 0;
-    private long lastStoredFrameMs = 0; // used when mode.storageIntervalMs > 0
 
-    // Proxima Centauri: best-frame selection state (only active when mode.storageIntervalMs > 0)
+    private long frameCount = 0;       // total frames passed through addFrame() (stored + skipped)
+    private long firstFrameTimeMs = 0; // wall-clock time of the very first stored frame;
+                                       // used by CameraActivity to compute elapsed time for phase transition
+
+    private long lastStoredFrameMs = 0; // wall-clock time of the last stored frame;
+                                        // only used by the old storageIntervalMs path (now replaced by Proxima handler)
+
+    // -------------------------------------------------------------------------
+    // Proxima Centauri: best-frame selection state
+    // (only active when mode.storageIntervalMs > 0)
+    // -------------------------------------------------------------------------
     private long lastProximaSampleMs = 0;
     private Bitmap proximaRefThumb = null;    // previous 1-second sample thumbnail for motion comparison
     private long proximaWindowStartMs = 0;   // wall-clock start of the current storageIntervalMs window
     private List<File> proximaCandidates = new ArrayList<>();
     private File proximaCandidatesDir = null; // sessionDir/candidates/ — temp files for current window
 
-    // Checkpoint support for persistence
+    // -------------------------------------------------------------------------
+    // Session persistence
+    // -------------------------------------------------------------------------
     private static final String CHECKPOINT_FILE_NAME = "framebuffer_checkpoint.dat";
-    private File checkpointFile;
+    private File checkpointFile; // records the timestamp of the buffer head for crash recovery
 
+    /**
+     * Constructs a FrameBuffer for the given mode.
+     *
+     * For disk-based modes, looks for an existing session directory on disk and restores
+     * it if found (so the delay continues across app restarts). If no existing session is
+     * found, creates a fresh directory. Only the most recent session is kept; older ones
+     * are deleted to prevent unbounded disk accumulation.
+     *
+     * @param context Used to resolve getExternalFilesDir() for the session directory.
+     * @param mode    The active celestial body configuration.
+     * @param thumbW  Width of thumbnails returned by addFrame() — matches CameraActivity's miniW.
+     * @param thumbH  Height of thumbnails returned by addFrame() — matches CameraActivity's miniH.
+     */
     public FrameBuffer(Context context, CelestialMode mode, int thumbW, int thumbH) {
         this.mode = mode;
         this.thumbW = thumbW;
         this.thumbH = thumbH;
         this.frameSkip = Math.max(1, mode.targetFps / mode.bufferFps);
+        // maxFrames is informational only — used in the log below; actual eviction is time-based
         int maxFrames = (int) (mode.delaySeconds * mode.bufferFps) + 1;
         this.emaAlpha = mode.emaAlpha;
 
         if (mode.useCompression) {
-            // Check for existing checkpoint files to restore previous session
             String startTime = FOLDER_FMT.format(new Date());
             File baseDir = context.getExternalFilesDir(null);
-            if (baseDir == null) baseDir = context.getFilesDir(); // fallback to internal
-            
-            // Look for existing sessions for this mode
+            if (baseDir == null) baseDir = context.getFilesDir(); // fallback to internal storage
+
+            // Find any existing session directories for this mode (e.g. from a previous launch).
             File[] existingSessions = findExistingSessions(baseDir, mode.name);
             File restoreSessionDir = null;
-            
+
             if (existingSessions != null && existingSessions.length > 0) {
-                // Use the most recent session; delete any older ones to prevent accumulation
+                // Keep only the most recent session; delete the rest to free disk space.
                 restoreSessionDir = existingSessions[0];
                 Log.d(TAG, "Found existing session to restore: " + restoreSessionDir.getAbsolutePath());
                 for (int i = 1; i < existingSessions.length; i++) {
@@ -113,16 +179,14 @@ public class FrameBuffer {
                     Log.d(TAG, "Deleted old session: " + existingSessions[i].getName());
                 }
             }
-            
+
             if (restoreSessionDir != null) {
-                // Restore from existing session directory
+                // Resume the existing session: scan its JPEG files back into the buffer.
                 sessionDir = restoreSessionDir;
                 checkpointFile = new File(sessionDir, CHECKPOINT_FILE_NAME);
-                
-                // Initialize buffers by scanning existing files
                 restoreFromExistingSession();
             } else {
-                // Create new session directory
+                // Fresh start: create a new timestamped session directory.
                 String sessionName = mode.name + "_" + startTime;
                 sessionDir = new File(baseDir, "AstroTimeDelay/" + sessionName);
                 sessionDir.mkdirs();
@@ -153,7 +217,8 @@ public class FrameBuffer {
     }
     
     /**
-     * Find existing sessions for a given mode name, sorted by most recent
+     * Scans AstroTimeDelay/ for directories matching "ModeName_*", sorted most-recent first.
+     * Returns null if the AstroTimeDelay directory doesn't exist yet.
      */
     private File[] findExistingSessions(File baseDir, String modeName) {
         try {
@@ -179,23 +244,30 @@ public class FrameBuffer {
     }
     
     /**
-     * Restore buffer state from an existing session directory
+     * Reloads an existing session directory into the buffer queues after an app restart.
+     *
+     * Scans sessionDir for JPEG files (direct children only — candidates/ subdir is excluded
+     * because listFiles() with the .jpg filter returns files, not subdirectories), parses each
+     * filename for its capture timestamp, and enqueues them in chronological order.
+     *
+     * firstFrameTimeMs is set from the checkpoint file if present, otherwise from the oldest
+     * frame's timestamp — this is what CameraActivity uses to decide whether to enter playback.
      */
     private void restoreFromExistingSession() {
         try {
             if (sessionDir == null || !sessionDir.exists()) return;
-            
+
             fileBuffer = new ArrayDeque<>();
             diskTimestampBuffer = new ArrayDeque<>();
-            
-            // Get list of all JPEG files in the session directory, sorted by name
-            File[] jpegFiles = sessionDir.listFiles((dir, name) -> 
+
+            // Scan direct JPEG children of sessionDir (sorted lexicographically = chronologically
+            // because the FILE_FMT timestamp format sorts correctly as a string).
+            File[] jpegFiles = sessionDir.listFiles((dir, name) ->
                 name.toLowerCase().endsWith(".jpg"));
-            
+
             if (jpegFiles != null) {
                 java.util.Arrays.sort(jpegFiles, (a, b) -> a.getName().compareTo(b.getName()));
-                
-                // Add all files to buffer (will be evicted properly based on timestamps)
+
                 for (File file : jpegFiles) {
                     if (file.isFile()) {
                         long timestamp = extractTimestampFromFile(file);
@@ -205,10 +277,11 @@ public class FrameBuffer {
                         }
                     }
                 }
-                
+
                 Log.d(TAG, "Restored " + fileBuffer.size() + " frames from existing session");
 
-                // Seed lastStoredFrameMs from the newest frame so we don't store again immediately
+                // Seed lastStoredFrameMs from the newest frame so addFrameToDisk() doesn't
+                // immediately write a duplicate on the very next camera frame.
                 if (!diskTimestampBuffer.isEmpty()) {
                     Long newest = ((ArrayDeque<Long>) diskTimestampBuffer).peekLast();
                     if (newest != null) lastStoredFrameMs = newest;
@@ -265,7 +338,10 @@ public class FrameBuffer {
     }
     
     /**
-     * Extract timestamp from filename
+     * Parses the capture timestamp from a JPEG filename.
+     * Handles both plain frames ("yyyy.MM.dd.HH.mm.ss.SSS.jpg") and
+     * Proxima winner frames ("yyyy.MM.dd.HH.mm.ss.SSS_m=X.XXXXX.jpg").
+     * Returns 0 if the name cannot be parsed (file is skipped during restore).
      */
     private long extractTimestampFromFile(File file) {
         try {
@@ -284,8 +360,11 @@ public class FrameBuffer {
         return 0;
     }
 
+    /** Wall-clock time of the first stored frame. Used by CameraActivity to compute
+     *  elapsed time and determine when to transition from queuing to playback. */
     public long getFirstFrameTimeMs() { return firstFrameTimeMs; }
 
+    /** EMA blending coefficient, passed through from CelestialMode for the ghost stack init. */
     public float getEmaAlpha() { return emaAlpha; }
 
     /**
@@ -428,6 +507,17 @@ public class FrameBuffer {
         return lastStoredThumb.copy(lastStoredThumb.getConfig(), false);
     }
 
+    /**
+     * Compresses bitmap as JPEG and appends it to the disk buffer.
+     *
+     * The JPEG write happens outside the synchronized block because it is slow (50–100 ms
+     * per frame at 1920×1080). Only the queue operations that follow are locked, keeping
+     * the camera thread responsive to the display thread's concurrent getDelayedFrame() calls.
+     *
+     * Time-based eviction runs after each write: frames older than delaySeconds are deleted
+     * from disk and dequeued. This ensures the buffer head always represents the correct
+     * wall-clock delay, even when actual encode throughput is below bufferFps.
+     */
     private void addFrameToDisk(Bitmap bitmap) {
         long captureTimeMs = System.currentTimeMillis();
         String filename = FILE_FMT.format(new Date(captureTimeMs)) + ".jpg";
@@ -509,9 +599,9 @@ public class FrameBuffer {
             File candidate = writeProximaCandidate(bitmap, nowMs, score);
             if (candidate != null) {
                 proximaCandidates.add(candidate);
-//                Log.d(TAG, "Proxima sample: score=" + String.format(Locale.US, "%.5f", score)
-//                        + "  candidates=" + proximaCandidates.size()
-//                        + "  file=" + candidate.getName());
+                Log.d(TAG, "Proxima sample: score=" + String.format(Locale.US, "%.5f", score)
+                        + "  candidates=" + proximaCandidates.size()
+                        + "  file=" + candidate.getName());
             }
         }
         bitmap.recycle();
@@ -552,7 +642,7 @@ public class FrameBuffer {
     private void selectBestProximaFrame(long nowMs) {
         if (proximaCandidates.isEmpty()) {
             proximaWindowStartMs = nowMs;
-//            Log.d(TAG, "Proxima window ended with no candidates; resetting window");
+            Log.d(TAG, "Proxima window ended with no candidates; resetting window");
             return;
         }
 
@@ -567,9 +657,9 @@ public class FrameBuffer {
             }
         }
 
-  //      Log.d(TAG, "Proxima window ended: winner=" + (winner != null ? winner.getName() : "none")
-  //              + "  score=" + String.format(Locale.US, "%.5f", bestScore)
-  //              + "  from " + proximaCandidates.size() + " candidates");
+        Log.d(TAG, "Proxima window ended: winner=" + (winner != null ? winner.getName() : "none")
+                + "  score=" + String.format(Locale.US, "%.5f", bestScore)
+                + "  from " + proximaCandidates.size() + " candidates");
 
         // Move winner from candidates/ to sessionDir/
         File winnerDest = null;
@@ -635,6 +725,24 @@ public class FrameBuffer {
         }
     }
 
+    /**
+     * Returns the oldest buffered frame — the one that should be displayed now.
+     *
+     * For disk modes: decodes the JPEG at the head of fileBuffer. A one-entry cache
+     * (cachedFrame / cachedFile) avoids re-decoding the same file on consecutive display
+     * ticks when no new permanent frame has been promoted. Cache is invalidated when
+     * fileBuffer.peek() returns a different file (i.e., addFrameToDisk evicted the head).
+     *
+     * The JPEG decode is intentionally outside the synchronized block — it takes 50–200 ms
+     * and must not block the camera thread. The synchronized block only reads/writes the
+     * cache pointers and buffer head, which are fast.
+     *
+     * For RAM mode: simply peeks the head Bitmap; no lock needed (ArrayDeque.peek is safe
+     * as long as eviction also runs on the same thread, which it does in addFrame).
+     *
+     * @return The oldest buffered Bitmap, or null if the buffer is empty or released.
+     *         The returned bitmap is owned by this class (do not recycle it externally).
+     */
     public Bitmap getDelayedFrame() {
         if (released) return null;
         if (mode.useCompression) {
@@ -729,6 +837,24 @@ public class FrameBuffer {
         return (float) changedPixels / totalPixels;
     }
 
+    /**
+     * Converts a CameraX ImageProxy (RGBA_8888 format) to a Bitmap.
+     *
+     * CameraX may pad each row in the image buffer to align it to a hardware-friendly
+     * boundary (e.g. 64-byte alignment). The padding is visible as extra pixels on the
+     * right edge of each row. This method accounts for it:
+     *
+     *   rowStride     — bytes per row including padding (may be > pixelStride × width)
+     *   pixelStride   — bytes per pixel (4 for RGBA_8888)
+     *   rowPadding    — extra bytes per row: rowStride − (pixelStride × width)
+     *
+     * When rowPadding > 0, the Bitmap is created wide enough to hold the padded rows
+     * (width + rowPadding/pixelStride), pixels are copied from the ByteBuffer directly,
+     * and then the Bitmap is cropped back to the real frame width. When rowPadding == 0
+     * (no padding — common on many devices), the extra allocation and crop are skipped.
+     *
+     * @return A Bitmap of exactly image.getWidth() × image.getHeight(), or null on error.
+     */
     @OptIn(markerClass = ExperimentalGetImage.class)
     private Bitmap imageProxyToBitmap(ImageProxy imageProxy) {
         try {
@@ -760,6 +886,17 @@ public class FrameBuffer {
         }
     }
 
+    /**
+     * Tears down this FrameBuffer. Must be called from CameraActivity.onDestroy().
+     *
+     * Sets the released flag immediately so any in-flight addFrame() call returns null
+     * without touching cleared state. For disk modes, the JPEG files are intentionally
+     * left on disk — they are the persistent session that the next launch will restore.
+     * Only the in-memory queues and the decoded-frame cache are freed here.
+     *
+     * Thumbnail bitmaps (lastStoredThumb, previousThumb, proximaRefThumb) are recycled
+     * under the lock because the display thread may be reading them concurrently.
+     */
     public void release() {
         released = true; // stop addFrame() ASAP if camera thread is still running
         if (mode.useCompression) {
@@ -890,10 +1027,7 @@ public class FrameBuffer {
         try {
             long headTimestamp = getCurrentFrameTimestamp();
             if (headTimestamp > 0) {
-                // Write timestamp of first frame in buffer as checkpoint - this preserves our position
-//                Log.d(TAG, "Saving checkpoint: head timestamp=" + headTimestamp);
-                
-                // Write the timestamp to our checkpoint file
+                // Write the timestamp of the buffer head to the checkpoint file.
                 java.io.FileWriter writer = new java.io.FileWriter(checkpointFile);
                 writer.write(String.valueOf(headTimestamp));
                 writer.close();
