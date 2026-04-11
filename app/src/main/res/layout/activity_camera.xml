@@ -78,7 +78,7 @@
         android:textSize="15sp"
         android:padding="8dp"
         android:fontFamily="monospace"
-        android:background="#80000000" />
+        android:background="@drawable/label_background" />
 
     <!-- Bottom-left label: countdown/timestamp.
          Bottom margin is adjusted in code to lift the row above the barcode strip. -->
@@ -101,7 +101,7 @@
             android:textSize="12sp"
             android:padding="8dp"
             android:fontFamily="monospace"
-            android:background="#80000000" />
+            android:background="@drawable/mode_indicator_background" />
 
     </LinearLayout>
 

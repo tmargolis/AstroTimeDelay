@@ -15,12 +15,17 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
 
 public class FrameBuffer {
     private static final String TAG = "FrameBuffer";
     private static final int JPEG_QUALITY = 60;
+
+    // Proxima Centauri: sample rate for motion scoring
+    private static final long PROXIMA_SAMPLE_INTERVAL_MS = 1000L; // 1 sample per second
 
     // Motion detection constants
     private static final int LUMA_DELTA_THRESHOLD = 18;
@@ -68,6 +73,13 @@ public class FrameBuffer {
     private long firstFrameTimeMs = 0;
     private long lastStoredFrameMs = 0; // used when mode.storageIntervalMs > 0
 
+    // Proxima Centauri: best-frame selection state (only active when mode.storageIntervalMs > 0)
+    private long lastProximaSampleMs = 0;
+    private Bitmap proximaRefThumb = null;    // previous 1-second sample thumbnail for motion comparison
+    private long proximaWindowStartMs = 0;   // wall-clock start of the current storageIntervalMs window
+    private List<File> proximaCandidates = new ArrayList<>();
+    private File proximaCandidatesDir = null; // sessionDir/candidates/ — temp files for current window
+
     // Checkpoint support for persistence
     private static final String CHECKPOINT_FILE_NAME = "framebuffer_checkpoint.dat";
     private File checkpointFile;
@@ -112,7 +124,14 @@ public class FrameBuffer {
                 String sessionName = mode.name + "_" + startTime;
                 sessionDir = new File(baseDir, "AstroTimeDelay/" + sessionName);
                 sessionDir.mkdirs();
-                
+
+                // Proxima: create candidates/ subdir and record window start time
+                if (mode.storageIntervalMs > 0) {
+                    proximaCandidatesDir = new File(sessionDir, "candidates");
+                    proximaCandidatesDir.mkdirs();
+                    proximaWindowStartMs = System.currentTimeMillis();
+                }
+
                 // Create checkpoint file for this session
                 checkpointFile = new File(sessionDir, CHECKPOINT_FILE_NAME);
                 
@@ -194,6 +213,29 @@ public class FrameBuffer {
                 }
             }
 
+            // Proxima: restore in-progress candidates from the candidates/ subdir so a
+            // crash mid-window continues accumulating rather than restarting from scratch.
+            if (mode.storageIntervalMs > 0) {
+                proximaCandidatesDir = new File(sessionDir, "candidates");
+                if (proximaCandidatesDir.exists()) {
+                    File[] candidateFiles = proximaCandidatesDir.listFiles(
+                            (dir, name) -> name.toLowerCase().endsWith(".jpg"));
+                    if (candidateFiles != null) {
+                        java.util.Arrays.sort(candidateFiles,
+                                (a, b) -> a.getName().compareTo(b.getName()));
+                        for (File f : candidateFiles) {
+                            if (f.isFile()) proximaCandidates.add(f);
+                        }
+                        Log.d(TAG, "Restored " + proximaCandidates.size()
+                                + " Proxima candidates from disk");
+                    }
+                } else {
+                    proximaCandidatesDir.mkdirs();
+                }
+                // Continue the window timer from now (better than an arbitrary past time)
+                proximaWindowStartMs = System.currentTimeMillis();
+            }
+
             // Check if there's a valid checkpoint to determine the starting point
             long checkpointTimestamp = getCheckpointTimestamp();
             if (checkpointTimestamp > 0) {
@@ -225,15 +267,15 @@ public class FrameBuffer {
      */
     private long extractTimestampFromFile(File file) {
         try {
-            String filename = file.getName();
-            int dotIndex = filename.lastIndexOf('.');
-            if (dotIndex > 0) {
-                String timestampPart = filename.substring(0, dotIndex);
-                Date date = FILE_FMT.parse(timestampPart);
-                if (date != null) {
-                    return date.getTime();
-                }
-            }
+            String base = file.getName();
+            // Strip .jpg extension
+            if (base.endsWith(".jpg")) base = base.substring(0, base.length() - 4);
+            // Strip _m=... score suffix present in Proxima winner filenames
+            int mIdx = base.indexOf("_m=");
+            if (mIdx >= 0) base = base.substring(0, mIdx);
+            // Parse the remaining timestamp string
+            Date date = FILE_FMT.parse(base);
+            if (date != null) return date.getTime();
         } catch (Exception e) {
             Log.e(TAG, "Error parsing timestamp from file: " + file.getName(), e);
         }
@@ -283,16 +325,16 @@ public class FrameBuffer {
     public Bitmap addFrame(ImageProxy imageProxy) {
         if (released) return null;
         try {
-            boolean shouldStore;
+            // Proxima Centauri: delegate entirely to best-frame selection handler.
+            // This short-circuits all frameSkip / shouldStore / addFrameToDisk logic below.
             if (mode.storageIntervalMs > 0) {
-                long nowMs = System.currentTimeMillis();
-                shouldStore = (frameCount == 0) || (nowMs - lastStoredFrameMs >= mode.storageIntervalMs);
-                if (shouldStore) lastStoredFrameMs = nowMs;
-            } else {
-                skipCounter++;
-                shouldStore = (skipCounter >= frameSkip);
-                if (shouldStore) skipCounter = 0;
+                return handleProximaFrame(imageProxy);
             }
+
+            boolean shouldStore;
+            skipCounter++;
+            shouldStore = (skipCounter >= frameSkip);
+            if (shouldStore) skipCounter = 0;
 
             // Always decode and return a thumbnail for the very first camera frame,
             // regardless of frameSkip. For Saturn (frameSkip=24), this means the ghost
@@ -365,7 +407,7 @@ public class FrameBuffer {
 
             if (frameCount % 30 == 0) {
                 int size = mode.useCompression ? fileBuffer.size() : bitmapBuffer.size();
-                Log.d(TAG, "Buffer: " + size + " frames");
+                Log.d(TAG, "Buffer size: " + size + " frames");
             }
 
             return thumb;
@@ -415,6 +457,179 @@ public class FrameBuffer {
             
             // Save checkpoint regularly to maintain persistence
             saveCheckpoint();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Proxima Centauri: best-frame selection methods
+    // -------------------------------------------------------------------------
+
+    /**
+     * Called for every camera frame in Proxima mode (storageIntervalMs > 0).
+     * Samples at 1fps, scores motion vs. the previous sample, writes candidates to disk.
+     * At the end of each storageIntervalMs window, promotes the highest-scoring candidate
+     * to a permanent frame in sessionDir and deletes all losers.
+     */
+    private Bitmap handleProximaFrame(ImageProxy imageProxy) {
+        long nowMs = System.currentTimeMillis();
+        boolean isFirst = (frameCount == 0);
+        boolean sampleDue = isFirst || (nowMs - lastProximaSampleMs >= PROXIMA_SAMPLE_INTERVAL_MS);
+        if (!sampleDue) return null;
+
+        Bitmap bitmap = imageProxyToBitmap(imageProxy);
+        if (bitmap == null) return null;
+
+        frameCount++;
+        if (frameCount == 1 && firstFrameTimeMs == 0) {
+            firstFrameTimeMs = nowMs;
+            proximaWindowStartMs = nowMs;
+        }
+        lastProximaSampleMs = nowMs;
+
+        Bitmap thumb = Bitmap.createScaledBitmap(bitmap, thumbW, thumbH, true);
+
+        // Compute motion score vs. previous 1-second sample (0 for the very first sample)
+        float score = 0f;
+        if (proximaRefThumb != null && !proximaRefThumb.isRecycled()) {
+            score = calculateMotionScore(thumb, proximaRefThumb);
+        }
+
+        // Update motion / screen-dimming fields read by CameraActivity
+        synchronized (this) {
+            motionDetected = score >= MOTION_FRACTION_THRESHOLD;
+            lastMotionScore = score;
+            if (lastStoredThumb != null && !lastStoredThumb.isRecycled()) lastStoredThumb.recycle();
+            lastStoredThumb = thumb.copy(thumb.getConfig(), false);
+        }
+
+        // Write candidate to candidates/ dir with score embedded in the filename
+        if (proximaCandidatesDir != null) {
+            File candidate = writeProximaCandidate(bitmap, nowMs, score);
+            if (candidate != null) {
+                proximaCandidates.add(candidate);
+//                Log.d(TAG, "Proxima sample: score=" + String.format(Locale.US, "%.5f", score)
+//                        + "  candidates=" + proximaCandidates.size()
+//                        + "  file=" + candidate.getName());
+            }
+        }
+        bitmap.recycle();
+
+        // Update reference thumbnail for the next second's comparison
+        if (proximaRefThumb != null && !proximaRefThumb.isRecycled()) proximaRefThumb.recycle();
+        proximaRefThumb = thumb.copy(thumb.getConfig(), false);
+
+        // Check whether the window has elapsed; if so, pick the best candidate
+        if (!isFirst && (nowMs - proximaWindowStartMs >= mode.storageIntervalMs)) {
+            selectBestProximaFrame(nowMs);
+        }
+
+        return thumb;
+    }
+
+    /**
+     * Writes bitmap as JPEG to candidates/ with timestamp and motion score in the filename.
+     * Filename format: yyyy.MM.dd.HH.mm.ss.SSS_m=X.XXXXX.jpg
+     */
+    private File writeProximaCandidate(Bitmap bitmap, long captureMs, float score) {
+        String timestamp = FILE_FMT.format(new Date(captureMs));
+        String filename = timestamp + "_m=" + String.format(Locale.US, "%.5f", score) + ".jpg";
+        File file = new File(proximaCandidatesDir, filename);
+        try (FileOutputStream fos = new FileOutputStream(file)) {
+            bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, fos);
+            return file;
+        } catch (IOException e) {
+            Log.e(TAG, "Error writing Proxima candidate: " + filename, e);
+            return null;
+        }
+    }
+
+    /**
+     * Called at end of each storageIntervalMs window. Finds the highest-scoring candidate,
+     * moves it to sessionDir as a permanent frame, and deletes all other candidates.
+     */
+    private void selectBestProximaFrame(long nowMs) {
+        if (proximaCandidates.isEmpty()) {
+            proximaWindowStartMs = nowMs;
+//            Log.d(TAG, "Proxima window ended with no candidates; resetting window");
+            return;
+        }
+
+        // Find the candidate with the highest motion score
+        File winner = null;
+        float bestScore = -1f;
+        for (File candidate : proximaCandidates) {
+            float score = extractScoreFromFilename(candidate.getName());
+            if (score > bestScore) {
+                bestScore = score;
+                winner = candidate;
+            }
+        }
+
+  //      Log.d(TAG, "Proxima window ended: winner=" + (winner != null ? winner.getName() : "none")
+  //              + "  score=" + String.format(Locale.US, "%.5f", bestScore)
+  //              + "  from " + proximaCandidates.size() + " candidates");
+
+        // Move winner from candidates/ to sessionDir/
+        File winnerDest = null;
+        if (winner != null) {
+            winnerDest = new File(sessionDir, winner.getName());
+            if (!winner.renameTo(winnerDest)) {
+                // renameTo fails across filesystems — fall back to copy + delete
+                try {
+                    copyFile(winner, winnerDest);
+                    winner.delete();
+                } catch (IOException e) {
+                    Log.e(TAG, "Failed to move Proxima winner to sessionDir", e);
+                    winnerDest = null;
+                }
+            }
+        }
+
+        // Delete all remaining candidate files (winner already moved; others are losers)
+        for (File candidate : proximaCandidates) {
+            if (candidate.exists()) candidate.delete();
+        }
+        proximaCandidates.clear();
+
+        // Add winner to the playback buffer
+        if (winnerDest != null) {
+            long winnerTs = extractTimestampFromFile(winnerDest);
+            if (winnerTs <= 0) winnerTs = nowMs;
+            synchronized (this) {
+                fileBuffer.add(winnerDest);
+                diskTimestampBuffer.add(winnerTs);
+                saveCheckpoint();
+            }
+            Log.d(TAG, "Proxima winner added to fileBuffer: " + winnerDest.getName());
+        }
+
+        // Reset for the next window
+        proximaWindowStartMs = nowMs;
+    }
+
+    /**
+     * Parses the _m=X.XXXXX motion score from a Proxima candidate or winner filename.
+     * Returns 0f if the suffix is absent (e.g. legacy files without a score).
+     */
+    private float extractScoreFromFilename(String name) {
+        int idx = name.indexOf("_m=");
+        if (idx < 0) return 0f;
+        try {
+            String scoreStr = name.substring(idx + 3); // e.g. "0.04712.jpg"
+            if (scoreStr.endsWith(".jpg")) scoreStr = scoreStr.substring(0, scoreStr.length() - 4);
+            return Float.parseFloat(scoreStr);
+        } catch (NumberFormatException e) {
+            return 0f;
+        }
+    }
+
+    /** Copies src to dst byte-for-byte. Used as fallback when File.renameTo() fails. */
+    private void copyFile(File src, File dst) throws IOException {
+        try (java.io.FileInputStream in = new java.io.FileInputStream(src);
+             FileOutputStream out = new FileOutputStream(dst)) {
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
         }
     }
 
@@ -566,11 +781,16 @@ public class FrameBuffer {
                 lastStoredThumb.recycle();
             }
             lastStoredThumb = null;
-            
+
             if (previousThumb != null && !previousThumb.isRecycled()) {
                 previousThumb.recycle();
             }
             previousThumb = null;
+
+            if (proximaRefThumb != null && !proximaRefThumb.isRecycled()) {
+                proximaRefThumb.recycle();
+            }
+            proximaRefThumb = null;
         }
 
         Log.d(TAG, "FrameBuffer released");
@@ -613,7 +833,13 @@ public class FrameBuffer {
             if (sessionDir != null && sessionDir.exists()) {
                 File[] files = sessionDir.listFiles();
                 if (files != null) {
-                    for (File f : files) f.delete();
+                    for (File f : files) {
+                        if (f.isDirectory()) {
+                            deleteDirectory(f); // e.g. candidates/
+                        } else {
+                            f.delete();
+                        }
+                    }
                 }
             }
         } else {
@@ -627,11 +853,16 @@ public class FrameBuffer {
         lastStoredThumb = null;
         if (previousThumb != null && !previousThumb.isRecycled()) previousThumb.recycle();
         previousThumb = null;
+        if (proximaRefThumb != null && !proximaRefThumb.isRecycled()) proximaRefThumb.recycle();
+        proximaRefThumb = null;
         firstFrameTimeMs = 0;
         frameCount = 0;
         skipCounter = 0;
         motionDetected = false;
         lastMotionScore = 0f;
+        lastProximaSampleMs = 0;
+        proximaWindowStartMs = 0;
+        proximaCandidates.clear();
         Log.d(TAG, "FrameBuffer cleared");
     }
 
@@ -658,7 +889,7 @@ public class FrameBuffer {
             long headTimestamp = getCurrentFrameTimestamp();
             if (headTimestamp > 0) {
                 // Write timestamp of first frame in buffer as checkpoint - this preserves our position
-                Log.d(TAG, "Saving checkpoint: head timestamp=" + headTimestamp);
+//                Log.d(TAG, "Saving checkpoint: head timestamp=" + headTimestamp);
                 
                 // Write the timestamp to our checkpoint file
                 java.io.FileWriter writer = new java.io.FileWriter(checkpointFile);

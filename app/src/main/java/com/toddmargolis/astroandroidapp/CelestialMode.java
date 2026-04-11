@@ -13,15 +13,18 @@ public class CelestialMode {
     public boolean useCompression;
     public float emaAlpha;
 
-    // Minimum milliseconds between displayView frame refreshes on the camera thread.
-    // Throttling prevents JPEG decode + renderFrame() from saturating the camera thread
-    // at modes with high buffer fps (Sun: 15/sec). Moon uses RAM bitmaps (no decode
-    // cost) so a tight interval is fine.
+    // Minimum milliseconds between displayView frame refreshes on the display thread.
+    // Throttles display updates to limit JPEG decode frequency.
     public int displayIntervalMs;
 
     // If > 0, store one frame per this many milliseconds instead of using frameSkip.
     // Use for modes with very low capture rates (e.g. 1 frame every 4 hours).
     public long storageIntervalMs = 0;
+
+    // How many seconds of live-feed history the barcode strip represents.
+    // 0 means "use delaySeconds". Override in factory methods when the barcode window
+    // should differ from the delay (e.g. Moon has a 1.3s delay but a 5s barcode window).
+    public float barcodeHistorySeconds = 0;
 
     public CelestialMode(String name, float delaySeconds, int overlayResourceId,
                          int targetWidth, int targetHeight, int targetFps, int bufferFps,
@@ -43,17 +46,19 @@ public class CelestialMode {
 
     // Factory methods for each mode
     public static CelestialMode createMoonMode() {
-        return new CelestialMode(
+        CelestialMode m = new CelestialMode(
                 "Moon",
                 1.3f,
                 R.drawable.moon_overlay,
-                1920, 1080, 30, 30,
-                0xFFFFFFFF,
+                1920, 1080, 30, 8,
+                0xFFD1D1D1,
                 true,
-                false,
-                66,
+                true,
+                125,
                 0.3f // Adjusted 2.5x from baseline ~0.118
         );
+        m.barcodeHistorySeconds = 10.0f;
+        return m;
     }
 
     public static CelestialMode createSunMode() {
@@ -90,13 +95,13 @@ public class CelestialMode {
                 133_848_480f,                         // 4.24 × 365.25 × 24 × 3600 s
                 R.drawable.proxima_centauri_milky_way,
                 1280, 720, 24, 1,                     // bufferFps overridden by storageIntervalMs
-                0xFFCC2200,                           // deep red tint
+                0xFFE0FFFF,                           // infrared
                 false,
-                true,                                 // disk storage
+                true,                   // disk storage
                 60_000,                               // display update every 60 s
                 0.001f                                // slow ghost accumulation
         );
-        m.storageIntervalMs = 4L * 3600 * 1000;      // 1 frame every 4 hours
+        m.storageIntervalMs = 4L * 60 * 60 * 1000;       // 1 frame every 4 hours
         return m;
     }
 }

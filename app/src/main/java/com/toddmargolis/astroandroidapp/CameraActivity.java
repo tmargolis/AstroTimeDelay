@@ -97,6 +97,7 @@ public class CameraActivity extends AppCompatActivity {
     private ArrayDeque<Bitmap> moonBarcodeBuffer;
     private int maxMoonBarcodeFrames;
     private Paint moonBarcodePaint;
+    private int moonBarcodeSlitWidth; // fixed px width per frame; keeps all slits equal-sized
 
     // Buffer-clear gesture: 10 taps in the top-right corner within 5 seconds
     private int clearTapCount = 0;
@@ -209,8 +210,11 @@ public class CameraActivity extends AppCompatActivity {
 
         barcodeW = dm.widthPixels;
         barcodeH = 120; // fills the 120px gap below the 16:9 ghost on Tab A9+ (1920×1200 screen)
-        // Use the mode's delay seconds for consistent timeline length across all modes
-        barcodeHistorySeconds = mode.delaySeconds;
+        // Use the mode's declared barcode window, or fall back to delaySeconds.
+        barcodeHistorySeconds = mode.barcodeHistorySeconds > 0 ? mode.barcodeHistorySeconds : mode.delaySeconds;
+        // Fixed slit width for Moon: barcodeW / (window * 6fps) ≈ 32px at 1920/10s/6fps.
+        // Using 6fps as the target display rate regardless of bufferFps.
+        moonBarcodeSlitWidth = Math.max(1, (int)(barcodeW / barcodeHistorySeconds / 6));
 
         int ghostDisplayH = screenW * 9 / 16;
         int emptyBottomPx = dm.heightPixels - ghostDisplayH;
@@ -380,6 +384,13 @@ public class CameraActivity extends AppCompatActivity {
     private void updateLayoutForPhase(boolean playback) {
         countdownOverlayView.setVisibility(playback ? View.GONE : View.VISIBLE);
         stackView.setVisibility(playback ? View.VISIBLE : View.GONE);
+        // During queuing the EMA ghost fills mainView; tint it to match playback.
+        // During playback mainView shows the already-tinted delayed frame, so clear.
+        if (playback) {
+            mainView.clearColorFilter();
+        } else {
+            mainView.setColorFilter(renderer.getResolvedTintColor(), android.graphics.PorterDuff.Mode.MULTIPLY);
+        }
         Bitmap tickBmp = Bitmap.createBitmap(barcodeW, barcodeH, Bitmap.Config.ARGB_8888);
         tickBmp.eraseColor(0x00000000);
         Canvas tickCanvas = new Canvas(tickBmp);
@@ -418,7 +429,7 @@ public class CameraActivity extends AppCompatActivity {
                 tickIntervalSec = 600f;
                 labelFormat = playback ? "-%dm" : "%dm";
             } else {
-                tickIntervalSec = 10f;
+                tickIntervalSec = 1f;
                 labelFormat = playback ? "-%ds" : "%ds";
             }
 
@@ -663,22 +674,37 @@ public class CameraActivity extends AppCompatActivity {
         lastBarcodeFrameMs = nowMs;
 
         barcodeAccum += dtSec / barcodeHistorySeconds * barcodeW;
-        int slitsToDraw = (int)barcodeAccum;
-        if (slitsToDraw <= 0) return;
-        barcodeAccum -= slitsToDraw;
 
-        int slitStartY = (miniH - barcodeH) / 2;
-        thumb.getPixels(rowAvgScratch, 0, miniW, 0, slitStartY, miniW, barcodeH);
-        for (int row = 0; row < barcodeH; row++) {
-            long rSum = 0, gSum = 0, bSum = 0;
-            int base = row * miniW;
-            for (int col = 0; col < miniW; col++) {
-                int px = rowAvgScratch[base + col];
-                rSum += (px >> 16) & 0xFF;
-                gSum += (px >> 8) & 0xFF;
-                bSum += px & 0xFF;
+        // Moon: accumulate until we have at least one fixed-width slit. Consume all
+        // complete slits at once so the barcode catches up correctly when updateBarcode
+        // is called less frequently than bufferFps (e.g. frameSkip reduces call rate).
+        int numMoonSlits = 0;
+        if (mode.name.equals("Moon")) {
+            numMoonSlits = (int)(barcodeAccum / moonBarcodeSlitWidth);
+            if (numMoonSlits == 0) return;
+            barcodeAccum -= numMoonSlits * moonBarcodeSlitWidth;
+        }
+
+        int slitsToDraw = (int)barcodeAccum;
+        if (!mode.name.equals("Moon")) {
+            if (slitsToDraw <= 0) return;
+            barcodeAccum -= slitsToDraw;
+        }
+
+        if (!mode.name.equals("Moon")) {
+            int slitStartY = (miniH - barcodeH) / 2;
+            thumb.getPixels(rowAvgScratch, 0, miniW, 0, slitStartY, miniW, barcodeH);
+            for (int row = 0; row < barcodeH; row++) {
+                long rSum = 0, gSum = 0, bSum = 0;
+                int base = row * miniW;
+                for (int col = 0; col < miniW; col++) {
+                    int px = rowAvgScratch[base + col];
+                    rSum += (px >> 16) & 0xFF;
+                    gSum += (px >> 8) & 0xFF;
+                    bSum += px & 0xFF;
+                }
+                slitPixels[row] = 0xFF000000 | ((int)(rSum / miniW) << 16) | ((int)(gSum / miniW) << 8) | (int)(bSum / miniW);
             }
-            slitPixels[row] = 0xFF000000 | ((int)(rSum / miniW) << 16) | ((int)(gSum / miniW) << 8) | (int)(bSum / miniW);
         }
 
         Bitmap writeBmp = useBarcodeDisplay1 ? barcodeDisplay1 : barcodeDisplay2;
@@ -686,24 +712,45 @@ public class CameraActivity extends AppCompatActivity {
         Canvas writeCanvas = useBarcodeDisplay1 ? barcodeCanvas1 : barcodeCanvas2;
         useBarcodeDisplay1 = !useBarcodeDisplay1;
 
+        int moonSlitTotal = numMoonSlits * moonBarcodeSlitWidth;
+        int shiftAmount = mode.name.equals("Moon") ? moonSlitTotal : slitsToDraw;
         if (barcodeFrameCount < barcodeW) {
             writeCanvas.drawBitmap(readBmp, 0f, 0f, null);
         } else {
-            Rect src = new Rect(slitsToDraw, 0, barcodeW, barcodeH);
-            Rect dst = new Rect(0, 0, barcodeW - slitsToDraw, barcodeH);
+            Rect src = new Rect(shiftAmount, 0, barcodeW, barcodeH);
+            Rect dst = new Rect(0, 0, barcodeW - shiftAmount, barcodeH);
             writeCanvas.drawBitmap(readBmp, src, dst, null);
         }
 
-        for (int i = 0; i < slitsToDraw; i++) {
-            int x;
-            if (barcodeFrameCount < barcodeW) {
-                x = barcodeFrameCount;
-                barcodeFrameCount++;
-            } else {
-                x = barcodeW - slitsToDraw + i;
+        if (mode.name.equals("Moon")) {
+            // Draw each accumulated slit as a separate fixed-width thumbnail so all
+            // frames appear the same size. When catch-up slits > 1 (frameSkip or stall),
+            // the same thumbnail is repeated — equivalent to "show previous frame".
+            if (numMoonSlits > 1) {
+                Log.d(TAG, "Moon barcode: repeating frame x" + numMoonSlits + " (gap=" + (int)(dtSec * 1000) + "ms)");
             }
-            if (x >= 0 && x < barcodeW) {
-                writeBmp.setPixels(slitPixels, 0, 1, x, 0, 1, barcodeH);
+            int cropTop = (miniH - barcodeH) / 2;
+            Rect thumbSrc = new Rect(0, cropTop, miniW, cropTop + barcodeH);
+            for (int s = 0; s < numMoonSlits; s++) {
+                int left = (barcodeFrameCount < barcodeW)
+                        ? barcodeFrameCount
+                        : barcodeW - moonSlitTotal + s * moonBarcodeSlitWidth;
+                int right = Math.min(left + moonBarcodeSlitWidth, barcodeW);
+                writeCanvas.drawBitmap(thumb, thumbSrc, new Rect(left, 0, right, barcodeH), null);
+                if (barcodeFrameCount < barcodeW) barcodeFrameCount = right;
+            }
+        } else {
+            for (int i = 0; i < slitsToDraw; i++) {
+                int x;
+                if (barcodeFrameCount < barcodeW) {
+                    x = barcodeFrameCount;
+                    barcodeFrameCount++;
+                } else {
+                    x = barcodeW - slitsToDraw + i;
+                }
+                if (x >= 0 && x < barcodeW) {
+                    writeBmp.setPixels(slitPixels, 0, 1, x, 0, 1, barcodeH);
+                }
             }
         }
 

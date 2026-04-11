@@ -68,6 +68,10 @@ public class OverlayRenderer {
         overlayPaint.setDither(true);
     }
 
+    public int getResolvedTintColor() {
+        return tintColor;
+    }
+
     public Bitmap renderFrame(Bitmap videoFrame, float overlayAlpha) {
         if (videoFrame == null) return null;
 
