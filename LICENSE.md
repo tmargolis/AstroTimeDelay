@@ -1,9 +1,9 @@
 Copyright (c) 2025 Todd Margolis. All rights reserved.
 
-================================================================================
-DELAYED VISION - COSMICALLY INSPIRED VIDEO MIRRORS
-Proprietary Artwork License
-================================================================================
+# DELAYED VISION
+## COSMICALLY INSPIRED VIDEO MIRRORS
+### Proprietary Artwork License
+--------------------------------------------------------------------------------
 
 This repository contains both software and the expression of an original
 artistic work. All components — including but not limited to the source code,
@@ -97,5 +97,3 @@ should be directed to:
 
   Todd Margolis
   toddmargolis.com
-
-================================================================================
