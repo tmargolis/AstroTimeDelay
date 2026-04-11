@@ -14,7 +14,9 @@ This work finds a powerful precedent in Margolis's 2012 augmented reality piece 
 
 ---
 
-## The Four Mirrors
+## The Mirrors
+
+Three modes — Moon, Sun, and Saturn — are designed for gallery and museum exhibition. The fourth, Proxima Centauri, is a Collector's Edition work for permanent private installation (see below).
 
 ### The Moon — 1.3 second delay
 
@@ -34,9 +36,11 @@ The "Saturn" mirror introduces a delay of nearly an hour and a half; the reflect
 
 **Light travel time:** Saturn → Earth ≈ 79 minutes at mean opposition distance (~1.28 billion km at 299,792 km/s)
 
-### Proxima Centauri — 4.24 year delay
+### Proxima Centauri — 4.24 year delay *(Collector's Edition)*
 
 The "Proxima Centauri" mirror is the most extreme: a delay of over four years. Because no single device can hold four years of video, the mirror stores just one frame every four hours — but not an arbitrary frame. Motion detection continuously evaluates the scene across each four-hour window, selecting the single most-changed moment as the representative image. The result is a mosaic of significant instants drawn from across years, a self-portrait assembled from the peaks of lived experience. The viewer confronts not a continuous record of their past, but a curated archaeology of their most active moments.
+
+This mode is a **Collector's Edition** work, distinct from the gallery and museum modes above. It is intended for permanent installation in a private home. Because the delay exceeds four years, the piece only achieves its full effect over the full arc of a collector's life in residence — the artwork matures with its owner. Each collector receives the piece only after a thorough conversation with the artist about what it means to live alongside a mirror that will not show you the present for years, and after formally agreeing to the responsibilities and implications of ownership.
 
 **Light travel time:** Proxima Centauri → Earth ≈ 4.24 years (4.013 × 10¹³ km at 299,792 km/s)
 
