@@ -40,6 +40,15 @@
         android:layout_height="80dp"
         android:text="SATURN\n75 minutes"
         android:textSize="18sp"
+        android:layout_marginBottom="24dp"
         android:backgroundTint="#D2691E" />  <!-- Reddish-golden -->
+
+    <Button
+        android:id="@+id/proximaButton"
+        android:layout_width="280dp"
+        android:layout_height="80dp"
+        android:text="PROXIMA CENTAURI\n4.24 years"
+        android:textSize="16sp"
+        android:backgroundTint="#CC2200" />  <!-- Deep red -->
 
 </LinearLayout>

@@ -66,6 +66,7 @@ public class FrameBuffer {
     private int skipCounter = 0;
     private long frameCount = 0;
     private long firstFrameTimeMs = 0;
+    private long lastStoredFrameMs = 0; // used when mode.storageIntervalMs > 0
 
     // Checkpoint support for persistence
     private static final String CHECKPOINT_FILE_NAME = "framebuffer_checkpoint.dat";
@@ -185,8 +186,14 @@ public class FrameBuffer {
                 }
                 
                 Log.d(TAG, "Restored " + fileBuffer.size() + " frames from existing session");
+
+                // Seed lastStoredFrameMs from the newest frame so we don't store again immediately
+                if (!diskTimestampBuffer.isEmpty()) {
+                    Long newest = ((ArrayDeque<Long>) diskTimestampBuffer).peekLast();
+                    if (newest != null) lastStoredFrameMs = newest;
+                }
             }
-            
+
             // Check if there's a valid checkpoint to determine the starting point
             long checkpointTimestamp = getCheckpointTimestamp();
             if (checkpointTimestamp > 0) {
@@ -276,9 +283,16 @@ public class FrameBuffer {
     public Bitmap addFrame(ImageProxy imageProxy) {
         if (released) return null;
         try {
-            skipCounter++;
-            boolean shouldStore = (skipCounter >= frameSkip);
-            if (shouldStore) skipCounter = 0;
+            boolean shouldStore;
+            if (mode.storageIntervalMs > 0) {
+                long nowMs = System.currentTimeMillis();
+                shouldStore = (frameCount == 0) || (nowMs - lastStoredFrameMs >= mode.storageIntervalMs);
+                if (shouldStore) lastStoredFrameMs = nowMs;
+            } else {
+                skipCounter++;
+                shouldStore = (skipCounter >= frameSkip);
+                if (shouldStore) skipCounter = 0;
+            }
 
             // Always decode and return a thumbnail for the very first camera frame,
             // regardless of frameSkip. For Saturn (frameSkip=24), this means the ghost
@@ -581,6 +595,44 @@ public class FrameBuffer {
     public synchronized File[] getBufferedFiles() {
         if (!mode.useCompression || fileBuffer == null) return new File[0];
         return fileBuffer.toArray(new File[0]);
+    }
+
+    /**
+     * Clears all buffered frames and resets state, as if the session just started.
+     * For disk modes: deletes all JPEG files and the checkpoint from the session directory.
+     * For RAM mode: recycles all bitmaps.
+     */
+    public synchronized void clearAllFrames() {
+        if (mode.useCompression) {
+            fileBuffer.clear();
+            diskTimestampBuffer.clear();
+            if (cachedFrame != null && !cachedFrame.isRecycled()) cachedFrame.recycle();
+            cachedFrame = null;
+            cachedFile = null;
+            // Delete all files in the session directory (JPEGs + checkpoint)
+            if (sessionDir != null && sessionDir.exists()) {
+                File[] files = sessionDir.listFiles();
+                if (files != null) {
+                    for (File f : files) f.delete();
+                }
+            }
+        } else {
+            for (Bitmap b : bitmapBuffer) {
+                if (b != null && !b.isRecycled()) b.recycle();
+            }
+            bitmapBuffer.clear();
+            timestampBuffer.clear();
+        }
+        if (lastStoredThumb != null && !lastStoredThumb.isRecycled()) lastStoredThumb.recycle();
+        lastStoredThumb = null;
+        if (previousThumb != null && !previousThumb.isRecycled()) previousThumb.recycle();
+        previousThumb = null;
+        firstFrameTimeMs = 0;
+        frameCount = 0;
+        skipCounter = 0;
+        motionDetected = false;
+        lastMotionScore = 0f;
+        Log.d(TAG, "FrameBuffer cleared");
     }
 
     /** Recursively delete a directory and all its contents. */

@@ -22,6 +22,7 @@ public class MainActivity extends AppCompatActivity {
         Button moonButton = findViewById(R.id.moonButton);
         Button sunButton = findViewById(R.id.sunButton);
         Button saturnButton = findViewById(R.id.saturnButton);
+        Button proximaButton = findViewById(R.id.proximaButton);
 
         moonButton.setOnClickListener(v -> {
             selectedMode = "MOON";
@@ -35,6 +36,11 @@ public class MainActivity extends AppCompatActivity {
 
         saturnButton.setOnClickListener(v -> {
             selectedMode = "SATURN";
+            checkCameraPermission();
+        });
+
+        proximaButton.setOnClickListener(v -> {
+            selectedMode = "PROXIMA_CENTAURI";
             checkCameraPermission();
         });
     }

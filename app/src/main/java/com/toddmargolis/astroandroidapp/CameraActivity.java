@@ -12,8 +12,10 @@ import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
+import android.widget.Toast;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -41,8 +43,7 @@ import java.util.concurrent.TimeUnit;
 public class CameraActivity extends AppCompatActivity {
     private static final String TAG = "CameraActivity";
 
-    private ImageView displayView;
-    private TextView modeLabel;
+    private ImageView mainView;
     private CelestialMode mode;
     private FrameBuffer frameBuffer;
     private OverlayRenderer renderer;
@@ -90,11 +91,19 @@ public class CameraActivity extends AppCompatActivity {
     private int[] rowAvgScratch;
     private float barcodeHistorySeconds;
     private volatile boolean barcodeHistoryLoading = false;
+    private volatile boolean emaHistoryLoading = false;
 
     // Moon-mode barcode: thumbnail copies of each buffered frame, drawn as scaled tiles
     private ArrayDeque<Bitmap> moonBarcodeBuffer;
     private int maxMoonBarcodeFrames;
     private Paint moonBarcodePaint;
+
+    // Buffer-clear gesture: 10 taps in the top-right corner within 5 seconds
+    private int clearTapCount = 0;
+    private long clearTapWindowStartMs = 0;
+    private static final int CLEAR_TAP_TARGET = 10;
+    private static final long CLEAR_TAP_WINDOW_MS = 5000;
+    private int screenW;
 
     // Checkpoint support
     private static final String PREFS_NAME = "AstroTimeDelayPrefs";
@@ -116,11 +125,17 @@ public class CameraActivity extends AppCompatActivity {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         setFullscreen();
 
-        displayView = findViewById(R.id.displayView);
-        TextView modeLabel = findViewById(R.id.modeLabel);
-        modeIndicator = findViewById(R.id.modeIndicator);
-        modeNameLabel = findViewById(R.id.modeNameLabel);
-        queuingLabel = findViewById(R.id.queuingLabel);
+        mainView = findViewById(R.id.mainView);
+        stackView = findViewById(R.id.stackView);
+        barcodeView = findViewById(R.id.barcodeView);
+
+        countdownOverlayView = findViewById(R.id.countdownOverlayView); // image overlay during countdown
+        queuingLabel = findViewById(R.id.queuingLabel); // "QUEUEING" label
+        tickView = findViewById(R.id.tickView); // ticks on barcode
+
+        LinearLayout bottomLabelRow = findViewById(R.id.bottomLabelRow);
+        modeNameLabel = findViewById(R.id.modeNameLabel); // Moon, Sun, Saturn eg "Moon / 1.3 second delay"
+        modeIndicator = findViewById(R.id.modeIndicator); //  eg "04/10/2026 10:09:14.870"
 
         String modeString = getIntent().getStringExtra("MODE");
         if (modeString == null) modeString = "MOON";
@@ -128,13 +143,14 @@ public class CameraActivity extends AppCompatActivity {
             case "MOON": mode = CelestialMode.createMoonMode(); break;
             case "SUN": mode = CelestialMode.createSunMode(); break;
             case "SATURN": mode = CelestialMode.createSaturnMode(); break;
+            case "PROXIMA_CENTAURI": mode = CelestialMode.createProximaCentauriMode(); break;
         }
 
-        modeLabel.setVisibility(View.GONE);
         modeIndicator.setVisibility(View.VISIBLE);
 
         DisplayMetrics dm = new DisplayMetrics();
         getWindowManager().getDefaultDisplay().getMetrics(dm);
+        screenW = dm.widthPixels;
         miniW = dm.widthPixels / 4;
         miniH = miniW * 9 / 16;
         int cornerH = miniH * 3 / 4;
@@ -148,20 +164,30 @@ public class CameraActivity extends AppCompatActivity {
             restoreState();
         }
 
-        stackView = findViewById(R.id.stackView);
-        countdownOverlayView = findViewById(R.id.countdownOverlayView);
         countdownOverlayView.setImageResource(mode.overlayResourceId);
-        if (mode.name.equals("Saturn")) {
-            countdownOverlayView.setScaleType(ImageView.ScaleType.MATRIX);
-            countdownOverlayView.setImageMatrix(new Matrix());
-        } else if (mode.name.equals("Sun")) {
-            countdownOverlayView.setScaleType(ImageView.ScaleType.FIT_START);
+        if (mode.name.equals("Proxima Centauri")) {
+            countdownOverlayView.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        } else if (mode.name.equals("Saturn")) {
+            countdownOverlayView.setScaleType(ImageView.ScaleType.CENTER);
+        } else if (mode.name.equals("Moon")) {
+            // Moon overlay is drawn at 50% of fit size in OverlayRenderer.
+            // Constrain the queueing view to half the frame dimensions so it matches.
+            countdownOverlayView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            FrameLayout.LayoutParams overlayLp = (FrameLayout.LayoutParams) countdownOverlayView.getLayoutParams();
+            overlayLp.width  = mode.targetWidth  / 2;
+            overlayLp.height = mode.targetHeight / 2;
+            overlayLp.gravity = Gravity.CENTER;
+            countdownOverlayView.setLayoutParams(overlayLp);
+        } else {
+            // Sun: fit centered (no cropping)
+            countdownOverlayView.setScaleType(ImageView.ScaleType.FIT_CENTER);
         }
 
         String nameText;
         switch (mode.name) {
             case "Sun": nameText = "Sun / 8 minute 20 second delay"; break;
             case "Saturn": nameText = "Saturn / 1.3 hour delay"; break;
+            case "Proxima Centauri": nameText = "Proxima Centauri / 4.24 year delay"; break;
             default: nameText = "Moon / 1.3 second delay"; break;
         }
         modeNameLabel.setText(nameText);
@@ -181,10 +207,16 @@ public class CameraActivity extends AppCompatActivity {
             powCurve[i] = (float) (Math.pow(i / 255.0, 0.8) * 255.0);
         }
 
-        barcodeW = dm.widthPixels - cornerW;
-        barcodeH = cornerH;
+        barcodeW = dm.widthPixels;
+        barcodeH = 120; // fills the 120px gap below the 16:9 ghost on Tab A9+ (1920×1200 screen)
         // Use the mode's delay seconds for consistent timeline length across all modes
         barcodeHistorySeconds = mode.delaySeconds;
+
+        int ghostDisplayH = screenW * 9 / 16;
+        int emptyBottomPx = dm.heightPixels - ghostDisplayH;
+        Log.d(TAG, "Ghost aspect: screen=" + screenW + "x" + dm.heightPixels
+                + "  ghost fills=" + screenW + "x" + ghostDisplayH
+                + "  empty bottom=" + emptyBottomPx + "px");
 
         barcodeDisplay1 = Bitmap.createBitmap(barcodeW, barcodeH, Bitmap.Config.ARGB_8888);
         barcodeDisplay2 = Bitmap.createBitmap(barcodeW, barcodeH, Bitmap.Config.ARGB_8888);
@@ -202,8 +234,6 @@ public class CameraActivity extends AppCompatActivity {
             moonBarcodePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
         }
 
-        tickView = findViewById(R.id.tickView);
-        barcodeView = findViewById(R.id.barcodeView);
         FrameLayout.LayoutParams barcodeLp = (FrameLayout.LayoutParams) barcodeView.getLayoutParams();
         barcodeLp.width = barcodeW;
         barcodeLp.height = barcodeH;
@@ -211,14 +241,18 @@ public class CameraActivity extends AppCompatActivity {
         barcodeView.setLayoutParams(barcodeLp);
         barcodeView.setImageBitmap(barcodeDisplay1);
 
-        LinearLayout bottomLabelRow = findViewById(R.id.bottomLabelRow);
         FrameLayout.LayoutParams rowLp = (FrameLayout.LayoutParams) bottomLabelRow.getLayoutParams();
         rowLp.bottomMargin = barcodeH;
         bottomLabelRow.setLayoutParams(rowLp);
 
+        FrameLayout.LayoutParams queuingLp = (FrameLayout.LayoutParams) queuingLabel.getLayoutParams();
+        queuingLp.bottomMargin = barcodeH;
+        queuingLabel.setLayoutParams(queuingLp);
+
+
         FrameLayout.LayoutParams stackLp = new FrameLayout.LayoutParams(cornerW, cornerH);
         stackLp.gravity = Gravity.BOTTOM | Gravity.END;
-        stackLp.setMargins(0, 0, 0, 0);
+        stackLp.setMargins(0, 0, 0, barcodeH + 5);
         stackView.setLayoutParams(stackLp);
 
         updateLayoutForPhase(isPlaybackPhase);
@@ -227,15 +261,76 @@ public class CameraActivity extends AppCompatActivity {
         cameraExecutor = Executors.newSingleThreadExecutor();
         displayExecutor = Executors.newSingleThreadExecutor();
 
-        // For disk-based modes, reconstruct the barcode from previously persisted frames.
-        // Runs on displayExecutor so it doesn't block the camera thread; updateBarcode()
-        // skips until this finishes.
+        // For disk-based modes, seed the EMA ghost and barcode from persisted frames.
+        // Both run on displayExecutor (sequential); EMA goes first so the ghost appears before the barcode.
+        // emaHistoryLoading / barcodeHistoryLoading block live updates until each finishes.
         if (mode.useCompression) {
+            emaHistoryLoading = true;
+            displayExecutor.submit(this::initEmaFromHistory);
             barcodeHistoryLoading = true;
             displayExecutor.submit(this::initBarcodeFromHistory);
         }
 
+        // Tap the top-right corner 10 times within 5 seconds to clear all stored frames.
+        float cornerPx = 200 * dm.density;
+        View rootLayout = findViewById(R.id.rootLayout);
+        rootLayout.setOnTouchListener((v, event) -> {
+            if (event.getAction() == MotionEvent.ACTION_DOWN
+                    && event.getX() >= screenW - cornerPx && event.getY() <= cornerPx) {
+                long nowMs = System.currentTimeMillis();
+                if (clearTapCount == 0 || nowMs - clearTapWindowStartMs > CLEAR_TAP_WINDOW_MS) {
+                    clearTapCount = 1;
+                    clearTapWindowStartMs = nowMs;
+                } else {
+                    clearTapCount++;
+                    if (clearTapCount >= CLEAR_TAP_TARGET) {
+                        clearTapCount = 0;
+                        triggerClear();
+                    }
+                }
+            }
+            return false; // don't consume — let other listeners fire normally
+        });
+
         initializeCamera();
+    }
+
+    private void triggerClear() {
+        frameBuffer.clearAllFrames();
+        isPlaybackPhase = false;
+        lastDisplayUpdateMs = 0;
+        stackInitialized = false;
+        barcodeFrameCount = 0;
+        barcodeAccum = 0f;
+        lastBarcodeFrameMs = 0;
+        barcodeHistoryLoading = false;
+        barcodeDisplay1.eraseColor(0xFF000000);
+        barcodeDisplay2.eraseColor(0xFF000000);
+        useBarcodeDisplay1 = true;
+        barcodeView.setImageBitmap(barcodeDisplay1);
+        mainView.setImageBitmap(null);
+        if (moonBarcodeBuffer != null) {
+            for (Bitmap b : moonBarcodeBuffer) {
+                if (b != null && !b.isRecycled()) b.recycle();
+            }
+            moonBarcodeBuffer.clear();
+        }
+        updateLayoutForPhase(false);
+        Toast.makeText(this, "Buffer cleared", Toast.LENGTH_SHORT).show();
+        Log.d(TAG, "Buffer cleared by gesture");
+    }
+
+    /**
+     * Routes the EMA ghost bitmap to the right view depending on phase:
+     * - Queuing: ghost fills mainView (barcode fills full-width bottom; no corner preview).
+     * - Playback: ghost goes to corner stackView (mainView shows the delayed frame).
+     */
+    private void postEmaFrame(Bitmap toPost) {
+        if (!isPlaybackPhase) {
+            runOnUiThread(() -> mainView.setImageBitmap(toPost));
+        } else {
+            runOnUiThread(() -> stackView.setImageBitmap(toPost));
+        }
     }
 
     private void updateScreenBrightness(boolean shouldDim) {
@@ -277,26 +372,14 @@ public class CameraActivity extends AppCompatActivity {
                 int m     = cal.get(Calendar.MINUTE);
                 int s     = cal.get(Calendar.SECOND);
                 int ms    = cal.get(Calendar.MILLISECOND);
-                modeIndicator.setText(String.format("%02d/%02d/%04d %02d:%02d:%02d.%03d", month, day, year, h, m, s, ms));
+                modeIndicator.setText(String.format("Playback from %02d/%02d/%04d %02d:%02d:%02d.%03d", month, day, year, h, m, s, ms));
             }
         }
     }
 
     private void updateLayoutForPhase(boolean playback) {
         countdownOverlayView.setVisibility(playback ? View.GONE : View.VISIBLE);
-        float tickIntervalSec;
-        String labelFormat;
-        if (mode.name.equals("Sun")) {
-            tickIntervalSec = 60f;
-            labelFormat = playback ? "-%dm" : "%dm";
-        } else if (mode.name.equals("Saturn")) {
-            tickIntervalSec = 600f;
-            labelFormat = playback ? "-%dm" : "%dm";
-        } else {
-            tickIntervalSec = 10f;
-            labelFormat = playback ? "-%ds" : "%ds";
-        }
-
+        stackView.setVisibility(playback ? View.VISIBLE : View.GONE);
         Bitmap tickBmp = Bitmap.createBitmap(barcodeW, barcodeH, Bitmap.Config.ARGB_8888);
         tickBmp.eraseColor(0x00000000);
         Canvas tickCanvas = new Canvas(tickBmp);
@@ -308,15 +391,48 @@ public class CameraActivity extends AppCompatActivity {
         textPaint.setTextSize(12 * getResources().getDisplayMetrics().density);
         textPaint.setAntiAlias(true);
 
-        float pixelsPerSec = (float)barcodeW / barcodeHistorySeconds;
-        for (int i = 1; ; i++) {
-            float timeVal = i * tickIntervalSec;
-            float tx = playback ? barcodeW - (timeVal * pixelsPerSec) : timeVal * pixelsPerSec;
-            if (tx < 0 || tx >= barcodeW) break;
-            tickCanvas.drawLine(tx, 0, tx, barcodeH, tickPaint);
-            String label = mode.name.equals("Moon") ? String.format(labelFormat, (int)timeVal) : String.format(labelFormat, (int)(timeVal / 60));
-            tickCanvas.drawText(label, tx + 4, textPaint.getTextSize(), textPaint);
+        if (mode.name.equals("Proxima Centauri")) {
+            // 5-row grid: each row = 1 year (24px tall), month ticks every barcodeW/12
+            int rowH = 24;
+            for (int row = 0; row < 5; row++) {
+                int year = 5 - row; // bottom row = year 1
+                int rowTop = row * rowH;
+                // Row separator line
+                if (row > 0) tickCanvas.drawLine(0, rowTop, barcodeW, rowTop, tickPaint);
+                // 11 month tick marks within each row
+                for (int mo = 1; mo < 12; mo++) {
+                    float tx = (float) mo / 12f * barcodeW;
+                    tickCanvas.drawLine(tx, rowTop, tx, rowTop + rowH, tickPaint);
+                }
+                // Year label at far left of each row
+                String label = "Y" + year;
+                tickCanvas.drawText(label, 4, rowTop + textPaint.getTextSize(), textPaint);
+            }
+        } else {
+            float tickIntervalSec;
+            String labelFormat;
+            if (mode.name.equals("Sun")) {
+                tickIntervalSec = 60f;
+                labelFormat = playback ? "-%dm" : "%dm";
+            } else if (mode.name.equals("Saturn")) {
+                tickIntervalSec = 600f;
+                labelFormat = playback ? "-%dm" : "%dm";
+            } else {
+                tickIntervalSec = 10f;
+                labelFormat = playback ? "-%ds" : "%ds";
+            }
+
+            float pixelsPerSec = (float)barcodeW / barcodeHistorySeconds;
+            for (int i = 1; ; i++) {
+                float timeVal = i * tickIntervalSec;
+                float tx = playback ? barcodeW - (timeVal * pixelsPerSec) : timeVal * pixelsPerSec;
+                if (tx < 0 || tx >= barcodeW) break;
+                tickCanvas.drawLine(tx, 0, tx, barcodeH, tickPaint);
+                String label = mode.name.equals("Moon") ? String.format(labelFormat, (int)timeVal) : String.format(labelFormat, (int)(timeVal / 60));
+                tickCanvas.drawText(label, tx + 4, textPaint.getTextSize(), textPaint);
+            }
         }
+
         tickView.setImageBitmap(tickBmp);
         FrameLayout.LayoutParams tickLp = (FrameLayout.LayoutParams) tickView.getLayoutParams();
         tickLp.width = barcodeW;
@@ -326,15 +442,25 @@ public class CameraActivity extends AppCompatActivity {
     }
 
     private String formatCountdown(int totalSeconds) {
-        if (totalSeconds >= 3600) {
+        if (totalSeconds >= 86400) {
+            int totalDays = totalSeconds / 86400;
+            int years  = totalDays / 365;
+            int months = (totalDays % 365) / 30;
+            int days   = (totalDays % 365) % 30;
+            String timeStr;
+            if (years > 0)  timeStr = String.format("%dy %dm %dd", years, months, days);
+            else if (months > 0) timeStr = String.format("%dm %dd", months, days);
+            else timeStr = String.format("%dd", totalDays);
+            return "buffering for " + timeStr;
+        } else if (totalSeconds >= 3600) {
             int h = totalSeconds / 3600;
             int m = (totalSeconds % 3600) / 60;
             int s = totalSeconds % 60;
-            return String.format("%02d:%02d:%02d", h, m, s);
+            return String.format("buffering for %02d:%02d:%02d", h, m, s);
         } else {
             int m = totalSeconds / 60;
             int s = totalSeconds % 60;
-            return String.format("%02d:%02d", m, s);
+            return String.format("buffering for %02d:%02d", m, s);
         }
     }
 
@@ -384,14 +510,14 @@ public class CameraActivity extends AppCompatActivity {
                                 float baseline = 0.5f;
                                 float dynamicAlpha = baseline + (1.0f - baseline) * (1.0f - (float)Math.log10(1.0 + 9.0 * historyProgress));
                                 Bitmap composited = renderer.renderFrame(delayedFrame, dynamicAlpha);
-                                runOnUiThread(() -> displayView.setImageBitmap(composited));
+                                runOnUiThread(() -> mainView.setImageBitmap(composited));
                             }
                         });
                     } else {
                         Bitmap delayedFrame = frameBuffer.getDelayedFrame();
                         if (delayedFrame != null) {
                             Bitmap composited = renderer.renderFrame(delayedFrame, 0.5f);
-                            runOnUiThread(() -> displayView.setImageBitmap(composited));
+                            runOnUiThread(() -> mainView.setImageBitmap(composited));
                         }
                     }
                 }
@@ -418,6 +544,7 @@ public class CameraActivity extends AppCompatActivity {
 
                     updateBarcode(thumb);
 
+                    if (!emaHistoryLoading) {
                     emaFrameCounter++;
                     if (!stackInitialized) {
                         thumb.getPixels(stackPixels, 0, miniW, 0, 0, miniW, miniH);
@@ -434,7 +561,7 @@ public class CameraActivity extends AppCompatActivity {
                         useDisplay1 = !useDisplay1;
                         buildDisplayBitmap(posted);
                         final Bitmap toPost = posted;
-                        runOnUiThread(() -> stackView.setImageBitmap(toPost));
+                        postEmaFrame(toPost);
                     } else if (emaFrameCounter >= emaUpdateEvery) {
                         emaFrameCounter = 0;
                         thumb.getPixels(stackPixels, 0, miniW, 0, 0, miniW, miniH);
@@ -449,8 +576,9 @@ public class CameraActivity extends AppCompatActivity {
                         useDisplay1 = !useDisplay1;
                         buildDisplayBitmap(posted);
                         final Bitmap toPost = posted;
-                        runOnUiThread(() -> stackView.setImageBitmap(toPost));
+                        postEmaFrame(toPost);
                     }
+                    } // end !emaHistoryLoading
 
                     thumb.recycle();
                 }
@@ -520,6 +648,10 @@ public class CameraActivity extends AppCompatActivity {
         if (barcodeHistoryLoading) return;
         if (!mode.useCompression) {
             updateMoonBarcode(thumb);
+            return;
+        }
+        if (mode.name.equals("Proxima Centauri")) {
+            updateProximaBarcode(thumb);
             return;
         }
         long nowMs = System.currentTimeMillis();
@@ -615,18 +747,134 @@ public class CameraActivity extends AppCompatActivity {
     }
 
     /**
+     * Proxima Centauri barcode: maps wall-clock position to (yearRow, xPos) and draws a
+     * 24-pixel-tall vertical slit. Year 1 is the bottom row; Year 5 is the top row.
+     * Position within each year is proportional to elapsed time within that year.
+     */
+    private void updateProximaBarcode(Bitmap thumb) {
+        long firstMs = frameBuffer.getFirstFrameTimeMs();
+        if (firstMs == 0) return;
+        long elapsedMs = System.currentTimeMillis() - firstMs;
+        long yearMs = (long)(365.25 * 24 * 3600 * 1000);
+        int yearIndex = (int) Math.min(elapsedMs / yearMs, 4); // 0 = year 1 (bottom)
+        int xPos = (int)((float)(elapsedMs % yearMs) / yearMs * barcodeW);
+        int rowH = 24;
+        int rowTop = (4 - yearIndex) * rowH; // bitmap y: year1 at y=96, year5 at y=0
+
+        // Extract center 24 rows from thumbnail and average across width
+        int slitStartY = (miniH - rowH) / 2;
+        int[] scratch24 = new int[miniW * rowH];
+        thumb.getPixels(scratch24, 0, miniW, 0, slitStartY, miniW, rowH);
+        int[] slit24 = new int[rowH];
+        for (int row = 0; row < rowH; row++) {
+            long r = 0, g = 0, b = 0;
+            for (int col = 0; col < miniW; col++) {
+                int px = scratch24[row * miniW + col];
+                r += (px >> 16) & 0xFF;
+                g += (px >> 8) & 0xFF;
+                b += px & 0xFF;
+            }
+            slit24[row] = 0xFF000000 | ((int)(r / miniW) << 16) | ((int)(g / miniW) << 8) | (int)(b / miniW);
+        }
+
+        Bitmap writeBmp = useBarcodeDisplay1 ? barcodeDisplay1 : barcodeDisplay2;
+        Bitmap readBmp  = useBarcodeDisplay1 ? barcodeDisplay2 : barcodeDisplay1;
+        Canvas writeCanvas = useBarcodeDisplay1 ? barcodeCanvas1 : barcodeCanvas2;
+        useBarcodeDisplay1 = !useBarcodeDisplay1;
+        writeCanvas.drawBitmap(readBmp, 0f, 0f, null);
+        if (xPos >= 0 && xPos < barcodeW) {
+            writeBmp.setPixels(slit24, 0, 1, xPos, rowTop, 1, rowH);
+        }
+        final Bitmap toPost = writeBmp;
+        runOnUiThread(() -> barcodeView.setImageBitmap(toPost));
+    }
+
+    /**
      * Reconstruct the barcode from previously persisted JPEG frames.
      * Runs on displayExecutor. Maps each barcode pixel to the nearest saved frame by
      * timestamp; leaves pixels black where no frame exists (gap while app was stopped).
      * Syncs both double-buffer bitmaps so the first live updateBarcode() call doesn't
      * flash the stale all-black buffer.
      */
+    /**
+     * Seeds the EMA ghost stack from previously stored frames on disk (Sun/Saturn).
+     * Runs on displayExecutor. Live EMA updates are blocked by emaHistoryLoading until this finishes.
+     */
+    private void initEmaFromHistory() {
+        File[] files = frameBuffer.getBufferedFiles();
+        if (files == null || files.length == 0) {
+            emaHistoryLoading = false;
+            return;
+        }
+
+        // Decode at the largest power-of-2 sample that still meets miniW
+        int sampleSize = 1;
+        while (sampleSize * 2 * miniW <= mode.targetWidth) sampleSize *= 2;
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inSampleSize = sampleSize;
+
+        boolean initialized = false;
+        for (File file : files) {
+            Bitmap decoded = BitmapFactory.decodeFile(file.getAbsolutePath(), opts);
+            if (decoded == null) continue;
+
+            Bitmap thumb;
+            if (decoded.getWidth() == miniW && decoded.getHeight() == miniH) {
+                thumb = decoded;
+            } else {
+                thumb = Bitmap.createScaledBitmap(decoded, miniW, miniH, true);
+                decoded.recycle();
+            }
+
+            thumb.getPixels(stackPixels, 0, miniW, 0, 0, miniW, miniH);
+
+            if (!initialized) {
+                for (int i = 0; i < miniW * miniH; i++) {
+                    int p = stackPixels[i];
+                    int base = i * 3;
+                    stackFloat[base]     = powCurve[(p >> 16) & 0xFF];
+                    stackFloat[base + 1] = powCurve[(p >> 8)  & 0xFF];
+                    stackFloat[base + 2] = powCurve[ p        & 0xFF];
+                }
+                initialized = true;
+            } else {
+                for (int i = 0; i < miniW * miniH; i++) {
+                    int p = stackPixels[i];
+                    int base = i * 3;
+                    stackFloat[base]     = emaFade * stackFloat[base]     + emaAdd * powCurve[(p >> 16) & 0xFF];
+                    stackFloat[base + 1] = emaFade * stackFloat[base + 1] + emaAdd * powCurve[(p >> 8)  & 0xFF];
+                    stackFloat[base + 2] = emaFade * stackFloat[base + 2] + emaAdd * powCurve[ p        & 0xFF];
+                }
+            }
+
+            thumb.recycle();
+        }
+
+        if (initialized) {
+            Bitmap posted = useDisplay1 ? stackDisplay1 : stackDisplay2;
+            useDisplay1 = !useDisplay1;
+            buildDisplayBitmap(posted);
+            final Bitmap toPost = posted;
+            stackInitialized = true;   // set before clearing flag so camera thread skips the seed branch
+            emaHistoryLoading = false;
+            postEmaFrame(toPost);
+        } else {
+            emaHistoryLoading = false;
+        }
+        Log.d(TAG, "EMA history init complete: " + files.length + " frames");
+    }
+
     private void initBarcodeFromHistory() {
         long[] timestamps = frameBuffer.getBufferedTimestamps();
         File[] files = frameBuffer.getBufferedFiles();
 
         if (files == null || files.length == 0) {
             barcodeHistoryLoading = false;
+            return;
+        }
+
+        if (mode.name.equals("Proxima Centauri")) {
+            initProximaBarcodeFromHistory(files, timestamps);
             return;
         }
 
@@ -669,6 +917,80 @@ public class CameraActivity extends AppCompatActivity {
         runOnUiThread(() -> barcodeView.setImageBitmap(toPost));
 
         barcodeHistoryLoading = false;
+    }
+
+    /**
+     * Reconstruct the 5-row Proxima Centauri barcode from stored files.
+     * Each file is mapped to its year row and x position by timestamp.
+     */
+    private void initProximaBarcodeFromHistory(File[] files, long[] timestamps) {
+        long firstMs = frameBuffer.getFirstFrameTimeMs();
+        if (firstMs == 0) {
+            barcodeHistoryLoading = false;
+            return;
+        }
+
+        Bitmap workBmp = Bitmap.createBitmap(barcodeW, barcodeH, Bitmap.Config.ARGB_8888);
+        workBmp.eraseColor(0xFF000000);
+
+        long yearMs = (long)(365.25 * 24 * 3600 * 1000);
+        int rowH = 24;
+
+        for (int fi = 0; fi < files.length; fi++) {
+            long ts = timestamps[fi];
+            long elapsedMs = ts - firstMs;
+            if (elapsedMs < 0) continue;
+            int yearIndex = (int) Math.min(elapsedMs / yearMs, 4);
+            int xPos = (int)((float)(elapsedMs % yearMs) / yearMs * barcodeW);
+            int rowTop = (4 - yearIndex) * rowH;
+
+            int[] slit = decodeFileToProximaSlit(files[fi], rowH);
+            if (slit != null && xPos >= 0 && xPos < barcodeW) {
+                workBmp.setPixels(slit, 0, 1, xPos, rowTop, 1, rowH);
+            }
+        }
+
+        barcodeCanvas1.drawBitmap(workBmp, 0f, 0f, null);
+        barcodeCanvas2.drawBitmap(workBmp, 0f, 0f, null);
+        workBmp.recycle();
+
+        useBarcodeDisplay1 = true;
+        final Bitmap toPost = barcodeDisplay1;
+        runOnUiThread(() -> barcodeView.setImageBitmap(toPost));
+        barcodeHistoryLoading = false;
+    }
+
+    /**
+     * Decode a JPEG file and return a 24-pixel-tall slit of averaged row colors,
+     * used for Proxima Centauri barcode reconstruction.
+     */
+    private int[] decodeFileToProximaSlit(File file, int rowH) {
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inSampleSize = 8;
+        Bitmap decoded = BitmapFactory.decodeFile(file.getAbsolutePath(), opts);
+        if (decoded == null) return null;
+
+        Bitmap thumb = Bitmap.createScaledBitmap(decoded, miniW, miniH, true);
+        decoded.recycle();
+
+        int slitStartY = (miniH - rowH) / 2;
+        int[] scratch = new int[miniW * rowH];
+        thumb.getPixels(scratch, 0, miniW, 0, slitStartY, miniW, rowH);
+        thumb.recycle();
+
+        int[] slit = new int[rowH];
+        for (int row = 0; row < rowH; row++) {
+            long r = 0, g = 0, b = 0;
+            int base = row * miniW;
+            for (int col = 0; col < miniW; col++) {
+                int px = scratch[base + col];
+                r += (px >> 16) & 0xFF;
+                g += (px >> 8) & 0xFF;
+                b += px & 0xFF;
+            }
+            slit[row] = 0xFF000000 | ((int)(r / miniW) << 16) | ((int)(g / miniW) << 8) | (int)(b / miniW);
+        }
+        return slit;
     }
 
     /**

@@ -19,6 +19,10 @@ public class CelestialMode {
     // cost) so a tight interval is fine.
     public int displayIntervalMs;
 
+    // If > 0, store one frame per this many milliseconds instead of using frameSkip.
+    // Use for modes with very low capture rates (e.g. 1 frame every 4 hours).
+    public long storageIntervalMs = 0;
+
     public CelestialMode(String name, float delaySeconds, int overlayResourceId,
                          int targetWidth, int targetHeight, int targetFps, int bufferFps,
                          int tintColor, boolean useAutoTint, boolean useCompression,
@@ -78,5 +82,21 @@ public class CelestialMode {
                 2000, // 0.5 fps display (79 min delay — 1 decode every 2 s is plenty)
                 0.0024f // Adjusted 2.5x from baseline ~0.00096
         );
+    }
+
+    public static CelestialMode createProximaCentauriMode() {
+        CelestialMode m = new CelestialMode(
+                "Proxima Centauri",
+                133_848_480f,                         // 4.24 × 365.25 × 24 × 3600 s
+                R.drawable.proxima_centauri_milky_way,
+                1280, 720, 24, 1,                     // bufferFps overridden by storageIntervalMs
+                0xFFCC2200,                           // deep red tint
+                false,
+                true,                                 // disk storage
+                60_000,                               // display update every 60 s
+                0.001f                                // slow ghost accumulation
+        );
+        m.storageIntervalMs = 4L * 3600 * 1000;      // 1 frame every 4 hours
+        return m;
     }
 }

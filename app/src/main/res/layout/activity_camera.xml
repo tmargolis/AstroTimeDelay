@@ -1,48 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/rootLayout"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <!-- Display for delayed video + overlay -->
+    <!-- Main display area for delayed video or ghost overlay -->
     <ImageView
-        android:id="@+id/displayView"
+        android:id="@+id/mainView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:scaleType="fitCenter" />
+        android:scaleType="fitStart" />
 
-    <!-- Mode indicator label -->
-    <TextView
-        android:id="@+id/modeLabel"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="top|center_horizontal"
-        android:layout_margin="16dp"
-        android:text="Mode"
-        android:textColor="#FFFFFF"
-        android:textSize="18sp"
-        android:padding="12dp"
-        android:background="#80000000" />
-
-    <!-- EMA ghost-stack mini-view (layout set programmatically; placed here so queuingLabel renders on top) -->
-    <ImageView
-        android:id="@+id/stackView"
-        android:layout_width="0dp"
-        android:layout_height="0dp"
-        android:layout_gravity="bottom|end"
-        android:layout_margin="16dp"
-        android:scaleType="fitXY"
-        android:background="@drawable/ghost_preview_border"
-        android:padding="1dp" />
-
-    <!-- Celestial object overlay shown during QUEUEING on top of the fullscreen ghost.
+    <!-- Celestial object image overlay shown during QUEUEING on top of the fullscreen ghost.
          Hidden during DELAY mode (the overlay is then composited into displayView by renderFrame).
          Size and scaleType are set in code per mode. -->
     <ImageView
         android:id="@+id/countdownOverlayView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:scaleType="fitCenter"
+        android:scaleType="centerCrop"
         android:alpha="0.5"
         android:visibility="gone" />
 
@@ -65,12 +42,24 @@
         android:layout_gravity="bottom"
         android:scaleType="fitXY" />
 
-    <!-- Large centered label shown while buffer is filling (on top of stackView) -->
+    <!-- EMA ghost-stack mini-view: shown in bottom-right corner during PLAYBACK only.
+         Layout dimensions set programmatically. Sits above barcode/ticks in z-order. -->
+    <ImageView
+        android:id="@+id/stackView"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_gravity="bottom|end"
+        android:scaleType="fitXY"
+        android:background="@drawable/ghost_preview_border"
+        android:padding="1dp"
+        android:visibility="gone" />
+
+    <!-- QUEUEING label anchored just above the barcode strip; bottom margin set in code. -->
     <TextView
         android:id="@+id/queuingLabel"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="center"
+        android:layout_gravity="bottom|center_horizontal"
         android:text="QUEUEING"
         android:textColor="#FFFFFF"
         android:textSize="48sp"
@@ -78,35 +67,36 @@
         android:alpha="0.7"
         android:visibility="gone" />
 
-    <!-- Bottom-left label row: mode name + delay, then countdown/timestamp to its right.
-         Both share a horizontal LinearLayout so the timer always sits flush right of the name.
+    <!-- Mode name at top-center of screen, above the celestial overlay. -->
+    <TextView
+        android:id="@+id/modeNameLabel"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:text=""
+        android:textColor="#FFFFFF"
+        android:textSize="15sp"
+        android:padding="8dp"
+        android:fontFamily="monospace"
+        android:background="#80000000" />
+
+    <!-- Bottom-left label: countdown/timestamp.
          Bottom margin is adjusted in code to lift the row above the barcode strip. -->
     <LinearLayout
         android:id="@+id/bottomLabelRow"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="bottom|start"
-        android:layout_marginStart="16dp"
+        android:layout_marginStart="0dp"
         android:layout_marginBottom="0dp"
         android:orientation="horizontal">
 
-        <TextView
-            android:id="@+id/modeNameLabel"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text=""
-            android:textColor="#FFFFFF"
-            android:textSize="12sp"
-            android:padding="8dp"
-            android:background="#80000000" />
-
-        <!-- Countdown / timestamp — sits immediately right of the mode name label -->
+        <!-- Countdown / timestamp -->
         <TextView
             android:id="@+id/modeIndicator"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginStart="4dp"
-            android:text="Moon"
+            android:text=""
             android:textColor="#FFFFFF"
             android:textSize="12sp"
             android:padding="8dp"
