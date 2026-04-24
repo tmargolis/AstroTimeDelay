@@ -364,6 +364,12 @@ public class FrameBuffer {
      *  elapsed time and determine when to transition from queuing to playback. */
     public long getFirstFrameTimeMs() { return firstFrameTimeMs; }
 
+    public File getSessionDir() { return sessionDir; }
+
+    public synchronized int getBufferedFrameCount() {
+        return fileBuffer == null ? 0 : fileBuffer.size();
+    }
+
     /** EMA blending coefficient, passed through from CelestialMode for the ghost stack init. */
     public float getEmaAlpha() { return emaAlpha; }
 

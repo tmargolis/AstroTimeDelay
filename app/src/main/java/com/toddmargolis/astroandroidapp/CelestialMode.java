@@ -223,7 +223,9 @@ public class CelestialMode {
         );
         // Store the best-motion frame from each 4-hour window (not simply every 4 hours).
         // See FrameBuffer.handleProximaFrame() for the motion-scoring and selection logic.
-        m.storageIntervalMs = 4L * 60 * 60 * 1000; // 4 hours in milliseconds
+        // 16,436,250 ms = yearMs / barcodeW (31,557,600,000 / 1920) — one pixel per window,
+        // so any frame timestamp within window N maps to exactly xPos N in the barcode.
+        m.storageIntervalMs = 16_436_250L;
         return m;
     }
 }

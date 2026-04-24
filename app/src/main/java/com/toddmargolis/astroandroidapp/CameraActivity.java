@@ -35,9 +35,19 @@ import com.google.android.gms.tasks.OnSuccessListener;
 import com.google.common.util.concurrent.ListenableFuture;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Calendar;
+import java.util.Comparator;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -135,6 +145,8 @@ public class CameraActivity extends AppCompatActivity {
     private float barcodeHistorySeconds;  // seconds of history the full barcode width represents
     private volatile boolean barcodeHistoryLoading = false; // true while initBarcodeFromHistory() runs
     private volatile boolean emaHistoryLoading = false;     // true while initEmaFromHistory() runs
+    private int proximaBarcodeNextX = 0;        // next sequential x position for Proxima barcode (bottom row)
+    private int proximaLastKnownFileCount = 0;  // fileBuffer.size() when we last drew a barcode slit
 
     // Moon-mode barcode: legacy tile buffer (used when useCompression=false; retained for RAM-mode fallback)
     private ArrayDeque<Bitmap> moonBarcodeBuffer;
@@ -346,6 +358,9 @@ public class CameraActivity extends AppCompatActivity {
             emaHistoryLoading = true;
             displayExecutor.submit(this::initEmaFromHistory);
             barcodeHistoryLoading = true;
+            if (mode.name.equals("Proxima Centauri")) {
+                displayExecutor.submit(this::migrateProximaToWindowAlignment);
+            }
             displayExecutor.submit(this::initBarcodeFromHistory);
         }
 
@@ -930,12 +945,21 @@ public class CameraActivity extends AppCompatActivity {
      * Position within each year is proportional to elapsed time within that year.
      */
     private void updateProximaBarcode(Bitmap thumb) {
+        // Only advance the barcode when a new permanent winner has been promoted to fileBuffer.
+        // This method is called on every candidate sample (1fps), but permanent frames are
+        // promoted only once per storageIntervalMs (~4.565h), so we must gate on the count.
+        int currentCount = frameBuffer.getBufferedFrameCount();
+        if (currentCount <= proximaLastKnownFileCount) return;
+        proximaLastKnownFileCount = currentCount;
+
         long firstMs = frameBuffer.getFirstFrameTimeMs();
         if (firstMs == 0) return;
         long elapsedMs = System.currentTimeMillis() - firstMs;
         long yearMs = (long)(365.25 * 24 * 3600 * 1000);
         int yearIndex = (int) Math.min(elapsedMs / yearMs, 4); // 0 = year 1 (bottom)
-        int xPos = (int)((float)(elapsedMs % yearMs) / yearMs * barcodeW);
+        // Sequential placement: each new permanent frame advances one pixel right, no gaps.
+        int xPos = proximaBarcodeNextX++;
+        Log.d(TAG, "PROXIMA_BARCODE: live update xPos=" + xPos + " yr=" + yearIndex + " fileCount=" + currentCount);
         int rowH = 24;
         int rowTop = (4 - yearIndex) * rowH; // bitmap y: year1 at y=96, year5 at y=0
 
@@ -1099,14 +1123,50 @@ public class CameraActivity extends AppCompatActivity {
 
     /**
      * Reconstruct the 5-row Proxima Centauri barcode from stored files.
-     * Each file is mapped to its year row and x position by timestamp.
+     * Scans sessionDir directly so it picks up any files added by migrateProximaToWindowAlignment().
+     * A gap-fill pass after rendering closes any single-pixel gaps caused by old 4h-interval
+     * frames not aligning perfectly to 4.565h pixel windows.
      */
-    private void initProximaBarcodeFromHistory(File[] files, long[] timestamps) {
+    private void initProximaBarcodeFromHistory(File[] ignored, long[] alsoIgnored) {
+        Log.d(TAG, "PROXIMA_BARCODE: initProximaBarcodeFromHistory START");
+        File sessionDir = frameBuffer.getSessionDir();
         long firstMs = frameBuffer.getFirstFrameTimeMs();
-        if (firstMs == 0) {
+        Log.d(TAG, "PROXIMA_BARCODE: sessionDir=" + sessionDir + " firstMs=" + firstMs);
+        if (sessionDir == null || firstMs == 0) {
+            Log.w(TAG, "PROXIMA_BARCODE: aborting — sessionDir null or firstMs=0");
             barcodeHistoryLoading = false;
             return;
         }
+
+        File[] allFiles = sessionDir.listFiles((d, name) ->
+                name.toLowerCase().endsWith(".jpg"));
+        int rawCount = allFiles == null ? 0 : allFiles.length;
+        Log.d(TAG, "PROXIMA_BARCODE: jpg files in sessionDir: " + rawCount);
+        if (allFiles == null || allFiles.length == 0) {
+            Log.w(TAG, "PROXIMA_BARCODE: aborting — no jpg files found");
+            barcodeHistoryLoading = false;
+            return;
+        }
+        Arrays.sort(allFiles, Comparator.comparing(File::getName)); // lex == chrono
+
+        SimpleDateFormat fmt = new SimpleDateFormat("yyyy.MM.dd.HH.mm.ss.SSS", Locale.US);
+        List<File> sortedFiles = new ArrayList<>();
+        List<Long>  sortedTs   = new ArrayList<>();
+        int parseFailCount = 0;
+        for (File f : allFiles) {
+            String base = f.getName().replace(".jpg", "");
+            int mIdx = base.indexOf("_m=");
+            if (mIdx >= 0) base = base.substring(0, mIdx);
+            try {
+                Date d = fmt.parse(base);
+                if (d != null) { sortedFiles.add(f); sortedTs.add(d.getTime()); }
+                else { parseFailCount++; Log.w(TAG, "PROXIMA_BARCODE: parse returned null for: " + f.getName()); }
+            } catch (ParseException ignored2) {
+                parseFailCount++;
+                Log.w(TAG, "PROXIMA_BARCODE: parse exception for: " + f.getName());
+            }
+        }
+        Log.d(TAG, "PROXIMA_BARCODE: parsed=" + sortedFiles.size() + " failed=" + parseFailCount);
 
         Bitmap workBmp = Bitmap.createBitmap(barcodeW, barcodeH, Bitmap.Config.ARGB_8888);
         workBmp.eraseColor(0xFF000000);
@@ -1114,18 +1174,42 @@ public class CameraActivity extends AppCompatActivity {
         long yearMs = (long)(365.25 * 24 * 3600 * 1000);
         int rowH = 24;
 
-        for (int fi = 0; fi < files.length; fi++) {
-            long ts = timestamps[fi];
-            long elapsedMs = ts - firstMs;
-            if (elapsedMs < 0) continue;
-            int yearIndex = (int) Math.min(elapsedMs / yearMs, 4);
-            int xPos = (int)((float)(elapsedMs % yearMs) / yearMs * barcodeW);
-            int rowTop = (4 - yearIndex) * rowH;
+        // Sequential x position per year row — each frame gets the next available pixel,
+        // left-to-right, with no gaps regardless of actual capture timestamp spacing.
+        int[] rowNextX = new int[5];
 
-            int[] slit = decodeFileToProximaSlit(files[fi], rowH);
-            if (slit != null && xPos >= 0 && xPos < barcodeW) {
+        int nullSlitCount = 0;
+        int skippedNegative = 0;
+        int[] rowSlitCount = new int[5];
+        for (int fi = 0; fi < sortedFiles.size(); fi++) {
+            long ts = sortedTs.get(fi);
+            long elapsedMs = ts - firstMs;
+            if (elapsedMs < 0) { skippedNegative++; continue; }
+            int yearIndex = (int) Math.min(elapsedMs / yearMs, 4);
+            int xPos = rowNextX[yearIndex]; // sequential — no timestamp math, no gaps
+            int rowTop = (4 - yearIndex) * rowH;
+            int[] slit = decodeFileToProximaSlit(sortedFiles.get(fi), rowH);
+            if (slit == null) {
+                nullSlitCount++;
+                Log.w(TAG, "PROXIMA_BARCODE: null slit for " + sortedFiles.get(fi).getName() + " yr=" + yearIndex + " xPos=" + xPos);
+            } else if (xPos < barcodeW) {
                 workBmp.setPixels(slit, 0, 1, xPos, rowTop, 1, rowH);
+                rowNextX[yearIndex]++;
+                rowSlitCount[yearIndex]++;
+                Log.d(TAG, "PROXIMA_BARCODE: placed fi=" + fi + " file=" + sortedFiles.get(fi).getName()
+                        + " yr=" + yearIndex + " xPos=" + xPos);
+            } else {
+                Log.w(TAG, "PROXIMA_BARCODE: xPos beyond barcodeW for " + sortedFiles.get(fi).getName());
             }
+        }
+        // Set the live-update cursor so new frames continue from the right edge of history.
+        proximaBarcodeNextX = rowNextX[0];
+        proximaLastKnownFileCount = frameBuffer.getBufferedFrameCount();
+        Log.d(TAG, "PROXIMA_BARCODE: slit placement done — nullSlits=" + nullSlitCount
+                + " skippedNeg=" + skippedNegative + " proximaBarcodeNextX=" + proximaBarcodeNextX);
+        for (int yi = 0; yi < 5; yi++) {
+            Log.d(TAG, "PROXIMA_BARCODE: row yi=" + yi + " slits=" + rowSlitCount[yi]
+                    + " nextX=" + rowNextX[yi]);
         }
 
         barcodeCanvas1.drawBitmap(workBmp, 0f, 0f, null);
@@ -1136,6 +1220,72 @@ public class CameraActivity extends AppCompatActivity {
         final Bitmap toPost = barcodeDisplay1;
         runOnUiThread(() -> barcodeView.setImageBitmap(toPost));
         barcodeHistoryLoading = false;
+    }
+
+    /**
+     * One-time migration: copies the nearest existing JPEG into any uncovered 4.565h
+     * barcode window so that initProximaBarcodeFromHistory sees a contiguous set of files.
+     * Writes proxima_migrated.flag on completion to skip future launches.
+     * Runs on displayExecutor before initBarcodeFromHistory.
+     */
+    private void migrateProximaToWindowAlignment() {
+        File sessionDir = frameBuffer.getSessionDir();
+        if (sessionDir == null) return;
+
+        File flag = new File(sessionDir, "proxima_migrated.flag");
+        if (flag.exists()) return;
+
+        long firstMs = frameBuffer.getFirstFrameTimeMs();
+        if (firstMs == 0) return;
+
+        File[] files = frameBuffer.getBufferedFiles();
+        long[] timestamps = frameBuffer.getBufferedTimestamps();
+        if (files == null || files.length == 0) return;
+
+        long yearMs = (long)(365.25 * 24 * 3600 * 1000);
+        long windowMs = yearMs / barcodeW; // 16,436,250 ms — one pixel per window
+
+        long lastTs = timestamps[timestamps.length - 1];
+        int numWindows = (int)((lastTs - firstMs) / windowMs) + 1;
+
+        SimpleDateFormat fmt = new SimpleDateFormat("yyyy.MM.dd.HH.mm.ss.SSS", Locale.US);
+        int copied = 0;
+
+        for (int w = 0; w < numWindows; w++) {
+            long winStart = firstMs + (long)w * windowMs;
+            long winEnd   = winStart + windowMs;
+
+            boolean covered = false;
+            for (long ts : timestamps) {
+                if (ts >= winStart && ts < winEnd) { covered = true; break; }
+            }
+            if (covered) continue;
+
+            int idx = nearestTimestampIndex(timestamps, winStart + windowMs / 2);
+            if (idx < 0) continue;
+
+            long midMs = winStart + windowMs / 2;
+            String newName = fmt.format(new Date(midMs)) + ".jpg";
+            File dest = new File(sessionDir, newName);
+            if (!dest.exists()) {
+                copyFileSilently(files[idx], dest);
+                copied++;
+            }
+        }
+
+        try { flag.createNewFile(); } catch (IOException ignored) {}
+        Log.d(TAG, "Proxima window-alignment migration complete: " + copied + " files added");
+    }
+
+    private void copyFileSilently(File src, File dst) {
+        try (FileInputStream in  = new FileInputStream(src);
+             FileOutputStream out = new FileOutputStream(dst)) {
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+        } catch (IOException e) {
+            Log.w(TAG, "Migration copy failed: " + src.getName(), e);
+        }
     }
 
     /**
