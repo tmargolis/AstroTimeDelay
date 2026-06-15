@@ -200,18 +200,6 @@ find "./AndroidTimeDelayBackup/Proxima Centauri_YYYY-MM-DD_HH-MM-SS" -type f | w
 
 The local count should match the count from the tablet.
 
-## Optional NAS Copy
-
-After backing up locally, copy the files to long-term storage with `rsync`:
-
-```bash
-rsync -avh --progress \
-  "./AndroidTimeDelayBackup/Proxima Centauri_YYYY-MM-DD_HH-MM-SS/" \
-  "/Volumes/NAS_OR_BACKUP_VOLUME/AndroidTimeDelay/Proxima Centauri_YYYY-MM-DD_HH-MM-SS/"
-```
-
-Backing up to the local disk first is usually faster and safer than pulling directly from ADB to a network volume, especially when copying thousands of small image files.
-
 ## Troubleshooting
 
 If `adb pull` copies fewer files than expected, confirm that the source path points to the full session folder rather than a subfolder such as `candidates/`.
