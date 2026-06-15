@@ -4,17 +4,62 @@
 
 The app is intended to run on a physical Android tablet with a front-facing camera.
 
-### Enable USB Debugging
+Here’s a concise section you can paste into `Setup.md`, probably near the top before the ADB backup section.
 
-1. On the tablet, open **Settings**.
+## Set Up a New Tablet
+
+Use these steps when preparing a new Samsung Galaxy Tab for development or installation.
+
+### 1. Connect to Wi-Fi
+
+Connect the tablet to Wi-Fi before configuring the app.
+
+This allows Android to sync the correct date, time, and time zone, which is important because captured frame filenames and playback timestamps depend on the device clock.
+
+Check:
+
+```text
+Settings → General management → Date and time
+```
+
+Recommended settings:
+
+```text
+Automatic date and time: On
+Automatic time zone: On
+```
+
+### 2. Enable Developer Mode
+
+1. Open **Settings**.
 2. Go to **About tablet**.
-3. Tap **Build number** seven times to enable Developer Options.
-4. Go back to **Settings → Developer options**.
-5. Turn on **USB debugging**.
-6. Connect the tablet to the development computer with a USB data cable.
-7. When prompted, choose **Always allow from this computer**, then tap **Allow**.
+3. Open **Software information**.
+4. Tap **Build number** seven times.
+5. Enter the device PIN/password if prompted.
+6. Confirm that Developer Options have been enabled.
 
-Verify that ADB can see the device:
+### 3. Disable Samsung Auto Blocker
+
+On some Samsung tablets, Auto Blocker prevents USB debugging.
+
+Disable it here:
+
+```text
+Settings → Security and privacy → Auto Blocker → Off
+```
+
+You may need to enter the device PIN/password.
+
+### 4. Enable USB Debugging
+
+1. Open **Settings**.
+2. Go to **Developer options**.
+3. Turn on **USB debugging**.
+4. Connect the tablet to the development computer with a USB data cable.
+5. When prompted, choose **Always allow from this computer**.
+6. Tap **Allow**.
+
+Verify the connection from the computer:
 
 ```bash
 adb devices
@@ -28,6 +73,44 @@ DEVICE_ID    device
 ```
 
 If the device appears as `unauthorized`, unlock the tablet and accept the USB debugging prompt. If needed, restart ADB:
+
+```bash
+adb kill-server
+adb start-server
+adb devices
+```
+
+### 5. Keep the Display Awake While Plugged In
+
+For development and installation use, prevent the display from sleeping while the tablet is plugged in.
+
+Enable:
+
+```text
+Settings → Developer options → Stay awake
+```
+
+This keeps the screen on while the device is charging or connected over USB.
+
+As a backup, set the normal screen timeout to the longest available value:
+
+```text
+Settings → Display → Screen timeout
+```
+
+### 6. Confirm Android Studio Sees the Tablet
+
+After USB debugging is enabled:
+
+1. Open Android Studio.
+2. Open the project from a local disk location.
+3. Wait for Gradle sync to finish.
+4. Open **Device Manager**.
+5. Confirm the tablet appears under physical devices.
+6. Select the tablet from the Run target dropdown.
+7. Run the `app` configuration.
+
+If Android Studio does not show the device but `adb devices` does, restart Android Studio and ADB:
 
 ```bash
 adb kill-server
