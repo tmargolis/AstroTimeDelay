@@ -95,6 +95,41 @@ public class CameraActivity extends AppCompatActivity {
     private long lastDisplayUpdateMs = 0; // tracks the last time the delayed frame was rendered
 
     // -------------------------------------------------------------------------
+    // Headline ticker (Proxima Centauri mode only)
+    // Scrolls Wikipedia Current Events leaf headlines (sentences only) from the lookback
+    // date; the topic each sentence belongs to is shown separately on the line below the
+    // date label and cross-fades in/out in sync with the ticker's manual scroll position.
+    // Refreshed once daily at local midnight; last successful fetch is cached to disk so
+    // the ticker never goes blank across a relaunch or network blip.
+    // -------------------------------------------------------------------------
+    private LinearLayout headlineRow;
+    private TextView headlineDateLabel;      // fixed, non-scrolling lookback-date label
+    private TextView headlineTicker;         // manually scrolled via scrollTo(), not marquee
+    private TextView headlineTopicLabel;     // fades between topics as the ticker scrolls
+    private ExecutorService headlineExecutor; // single thread for the daily network fetch
+    private final Runnable headlineFetchRunnable = new Runnable() {
+        @Override public void run() {
+            headlineExecutor.execute(() -> fetchAndUpdateHeadlines());
+            timerHandler.postDelayed(this, 24L * 60 * 60 * 1000);
+        }
+    };
+
+    private List<HeadlineTicker.HeadlineItem> headlineItems = new ArrayList<>();
+    private int[] headlineItemStartPx = new int[0]; // pixel x-offset of each item's sentence
+    private int headlineLoopWidthPx = 0;            // width of one full loop, incl. trailing gap
+    private int headlineScrollX = 0;
+    private int headlineCurrentTopicIndex = -1;
+    private static final String HEADLINE_GAP = "   ";
+    private static final int HEADLINE_SCROLL_INTERVAL_MS = 33; // ~30fps
+    private static final int HEADLINE_SCROLL_STEP_PX = 2;      // ~60px/s
+    private final Runnable headlineScrollRunnable = new Runnable() {
+        @Override public void run() {
+            advanceHeadlineScroll();
+            timerHandler.postDelayed(this, HEADLINE_SCROLL_INTERVAL_MS);
+        }
+    };
+
+    // -------------------------------------------------------------------------
     // Presence detection and screen dimming
     // -------------------------------------------------------------------------
     private long lastMovementTimeMs = System.currentTimeMillis();
@@ -147,6 +182,7 @@ public class CameraActivity extends AppCompatActivity {
     private volatile boolean emaHistoryLoading = false;     // true while initEmaFromHistory() runs
     private int proximaBarcodeNextX = 0;        // next sequential x position for Proxima barcode (bottom row)
     private int proximaLastKnownFileCount = 0;  // fileBuffer.size() when we last drew a barcode slit
+    private int proximaLastKnownEmaCount = 0;   // fileBuffer.size() when the EMA ghost last updated
 
     // Moon-mode barcode: legacy tile buffer (used when useCompression=false; retained for RAM-mode fallback)
     private ArrayDeque<Bitmap> moonBarcodeBuffer;
@@ -185,6 +221,8 @@ public class CameraActivity extends AppCompatActivity {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         setFullscreen();
 
+        headlineExecutor = Executors.newSingleThreadExecutor();
+
         mainView = findViewById(R.id.mainView);
         stackView = findViewById(R.id.stackView);
         barcodeView = findViewById(R.id.barcodeView);
@@ -192,6 +230,10 @@ public class CameraActivity extends AppCompatActivity {
         countdownOverlayView = findViewById(R.id.countdownOverlayView); // image overlay during countdown
         queuingLabel = findViewById(R.id.queuingLabel); // "QUEUEING" label
         tickView = findViewById(R.id.tickView); // ticks on barcode
+        headlineRow = findViewById(R.id.headlineRow);
+        headlineDateLabel = findViewById(R.id.headlineDateLabel);
+        headlineTicker = findViewById(R.id.headlineTicker); // Proxima Centauri lookback-date headlines
+        headlineTopicLabel = findViewById(R.id.headlineTopicLabel);
 
         LinearLayout bottomLabelRow = findViewById(R.id.bottomLabelRow);
         modeNameLabel = findViewById(R.id.modeNameLabel); // Moon, Sun, Saturn eg "Moon / 1.3 second delay"
@@ -339,6 +381,40 @@ public class CameraActivity extends AppCompatActivity {
         queuingLp.bottomMargin = barcodeH;
         queuingLabel.setLayoutParams(queuingLp);
 
+        if (mode.name.equals("Proxima Centauri")) {
+            // Position the ticker above queuingLabel's rendered height (computed from its
+            // fixed 48sp text size, not measured live — queuingLabel starts GONE, so it
+            // wouldn't be laid out yet) so the two never overlap during the years-long
+            // queueing phase.
+            Paint queuingMeasure = new Paint();
+            queuingMeasure.setTextSize(48 * getResources().getDisplayMetrics().scaledDensity);
+            Paint.FontMetrics fm = queuingMeasure.getFontMetrics();
+            int queuingLabelH = (int) Math.ceil(fm.bottom - fm.top);
+
+            FrameLayout.LayoutParams rowLp2 = (FrameLayout.LayoutParams) headlineRow.getLayoutParams();
+            rowLp2.bottomMargin = barcodeH + queuingLabelH;
+            headlineRow.setLayoutParams(rowLp2);
+
+            headlineRow.setVisibility(View.VISIBLE);
+            // Force these in code: the XML android:scrollHorizontally attribute alone was
+            // not reliably producing an unbounded internal text layout, which made scrollTo()
+            // a no-op and left the ticker showing only its first clipped line of text forever.
+            headlineTicker.setSingleLine(true);
+            headlineTicker.setHorizontallyScrolling(true);
+            headlineTicker.setEllipsize(null);
+            headlineTicker.setHorizontalFadingEdgeEnabled(true);
+            headlineTicker.setFadingEdgeLength((int) (24 * getResources().getDisplayMetrics().density));
+
+            List<HeadlineTicker.HeadlineItem> cachedItems = HeadlineTicker.readCachedItems(this);
+            String cachedDateLabel = HeadlineTicker.readCachedDateLabel(this);
+            if (!cachedItems.isEmpty()) applyHeadlineItems(cachedItems);
+            if (cachedDateLabel != null) headlineDateLabel.setText(cachedDateLabel);
+
+            headlineExecutor.execute(() -> fetchAndUpdateHeadlines()); // populate/refresh immediately
+            scheduleHeadlineFetch(); // then daily at local midnight thereafter
+            timerHandler.post(headlineScrollRunnable);
+        }
+
 
         FrameLayout.LayoutParams stackLp = new FrameLayout.LayoutParams(cornerW, cornerH);
         stackLp.gravity = Gravity.BOTTOM | Gravity.END;
@@ -443,6 +519,112 @@ public class CameraActivity extends AppCompatActivity {
             modeNameLabel.setAlpha(alpha);
             Log.d(TAG, "Brightness updated: isDimmed=" + shouldDim);
         });
+    }
+
+    /** Schedules headlineFetchRunnable to fire at the next local midnight, then every 24h after. */
+    private void scheduleHeadlineFetch() {
+        Calendar nextMidnight = Calendar.getInstance();
+        nextMidnight.add(Calendar.DAY_OF_YEAR, 1);
+        nextMidnight.set(Calendar.HOUR_OF_DAY, 0);
+        nextMidnight.set(Calendar.MINUTE, 0);
+        nextMidnight.set(Calendar.SECOND, 0);
+        nextMidnight.set(Calendar.MILLISECOND, 0);
+        long delay = nextMidnight.getTimeInMillis() - System.currentTimeMillis();
+        timerHandler.postDelayed(headlineFetchRunnable, delay);
+    }
+
+    /** Runs on headlineExecutor. Fetches the lookback date's headlines and updates the ticker. */
+    private void fetchAndUpdateHeadlines() {
+        Calendar lookback = HeadlineTicker.lookbackDate(mode.delaySeconds);
+        String dateLabel = HeadlineTicker.formatDateLabel(lookback);
+        List<HeadlineTicker.HeadlineItem> items = HeadlineTicker.fetchHeadlines(lookback);
+        if (items != null) {
+            HeadlineTicker.writeCache(this, items, dateLabel);
+            runOnUiThread(() -> {
+                headlineDateLabel.setText(dateLabel);
+                applyHeadlineItems(items);
+            });
+        } else {
+            Log.w(TAG, "Headline fetch returned no data; keeping previous ticker text");
+        }
+    }
+
+    /**
+     * Lays out a new set of headline items into headlineTicker's text: each item's sentence
+     * back-to-back with a small gap, doubled with one more gap so scrolling can wrap
+     * seamlessly (resetting scrollX by one loop width lands on an identical visual). Item
+     * pixel offsets are measured with the ticker's own Paint so they match its actual font.
+     */
+    private void applyHeadlineItems(List<HeadlineTicker.HeadlineItem> items) {
+        headlineItems = items;
+        headlineScrollX = 0;
+        headlineCurrentTopicIndex = -1;
+        headlineTicker.scrollTo(0, 0);
+
+        if (items.isEmpty()) {
+            headlineTicker.setText("");
+            headlineItemStartPx = new int[0];
+            headlineLoopWidthPx = 0;
+            return;
+        }
+
+        Paint paint = headlineTicker.getPaint();
+        StringBuilder sb = new StringBuilder();
+        int[] startPx = new int[items.size()];
+        for (int i = 0; i < items.size(); i++) {
+            startPx[i] = (int) paint.measureText(sb.toString());
+            sb.append(items.get(i).sentence);
+            if (i < items.size() - 1) sb.append(HEADLINE_GAP);
+        }
+        String singleCopy = sb.toString();
+        int gapWidthPx = (int) paint.measureText(HEADLINE_GAP);
+        headlineItemStartPx = startPx;
+        headlineLoopWidthPx = (int) paint.measureText(singleCopy) + gapWidthPx;
+
+        headlineTicker.setText(singleCopy + HEADLINE_GAP + singleCopy);
+    }
+
+    /** Called every HEADLINE_SCROLL_INTERVAL_MS while Proxima mode is active. */
+    private void advanceHeadlineScroll() {
+        if (headlineItems.isEmpty() || headlineLoopWidthPx <= 0) return;
+
+        headlineScrollX += HEADLINE_SCROLL_STEP_PX;
+        if (headlineScrollX >= headlineLoopWidthPx) headlineScrollX -= headlineLoopWidthPx;
+        headlineTicker.scrollTo(headlineScrollX, 0);
+
+        int viewportPx = headlineTicker.getWidth();
+        if (viewportPx <= 0) return; // not laid out yet
+
+        // The item now appearing at the ticker's right edge determines the current topic.
+        int rightEdgePx = (headlineScrollX + viewportPx) % headlineLoopWidthPx;
+        int newIndex = findHeadlineIndexForX(rightEdgePx);
+        if (newIndex != headlineCurrentTopicIndex) {
+            headlineCurrentTopicIndex = newIndex;
+            crossfadeTopic(headlineItems.get(newIndex).prefix);
+        }
+    }
+
+    /** Index of the last item whose sentence starts at or before pixel x within one loop. */
+    private int findHeadlineIndexForX(int x) {
+        int result = 0;
+        for (int i = 0; i < headlineItemStartPx.length; i++) {
+            if (headlineItemStartPx[i] <= x) result = i; else break;
+        }
+        return result;
+    }
+
+    /** Fades headlineTopicLabel out, swaps its text, then fades the new topic in. */
+    private void crossfadeTopic(String topic) {
+        if (topic.contentEquals(headlineTopicLabel.getText())) return;
+        headlineTopicLabel.animate().cancel();
+        headlineTopicLabel.animate()
+                .alpha(0f)
+                .setDuration(300)
+                .withEndAction(() -> {
+                    headlineTopicLabel.setText(topic);
+                    headlineTopicLabel.animate().alpha(1f).setDuration(300).start();
+                })
+                .start();
     }
 
     /**
@@ -568,7 +750,7 @@ public class CameraActivity extends AppCompatActivity {
             if (years > 0)  timeStr = String.format("%dy %dm %dd", years, months, days);
             else if (months > 0) timeStr = String.format("%dm %dd", months, days);
             else timeStr = String.format("%dd", totalDays);
-            return "buffering for " + timeStr;
+            return "buffering for another " + timeStr;
         } else if (totalSeconds >= 3600) {
             int h = totalSeconds / 3600;
             int m = (totalSeconds % 3600) / 60;
@@ -669,16 +851,34 @@ public class CameraActivity extends AppCompatActivity {
                     // Update the barcode strip with the new thumbnail.
                     updateBarcode(thumb);
 
-                    // EMA ghost stack update — blocked while initEmaFromHistory() is running
-                    // so history frames and live frames don't intermix mid-replay.
-                    if (!emaHistoryLoading) {
+                    // EMA ghost stack update — blocked while initEmaFromHistory() is running so
+                    // history frames and live frames don't intermix mid-replay. For Proxima Centauri,
+                    // also gated on the promoted-file count so the ghost only updates once per
+                    // storageIntervalMs (~4.5h), matching the emaAlpha=0.001 tuning intent — not on
+                    // every ~1s motion-scoring candidate sample from FrameBuffer.handleProximaFrame().
+                    // The blend uses the actual promoted winner's pixels (re-decoded from disk),
+                    // not this tick's live candidate, since the winner may have been captured
+                    // anywhere earlier in the closed window.
+                    boolean proximaFrameReady = true;
+                    Bitmap emaSourceThumb = thumb;
+                    if (mode.name.equals("Proxima Centauri")) {
+                        int currentCount = frameBuffer.getBufferedFrameCount();
+                        proximaFrameReady = currentCount > proximaLastKnownEmaCount;
+                        if (proximaFrameReady) {
+                            proximaLastKnownEmaCount = currentCount;
+                            emaSourceThumb = decodeProximaWinnerThumb();
+                            proximaFrameReady = (emaSourceThumb != null);
+                        }
+                    }
+
+                    if (!emaHistoryLoading && proximaFrameReady) {
                         emaFrameCounter++;
 
                         if (!stackInitialized) {
                             // First frame: seed the entire stack with this thumbnail at full opacity.
                             // This ensures the ghost is immediately visible rather than fading in
                             // from black over many frames.
-                            thumb.getPixels(stackPixels, 0, miniW, 0, 0, miniW, miniH);
+                            emaSourceThumb.getPixels(stackPixels, 0, miniW, 0, 0, miniW, miniH);
                             for (int i = 0; i < miniW * miniH; i++) {
                                 int p = stackPixels[i];
                                 int base = i * 3;
@@ -697,7 +897,7 @@ public class CameraActivity extends AppCompatActivity {
                             // Batch update: blend emaUpdateEvery frames worth of alpha in one step.
                             // See emaFade/emaAdd initialization in onCreate for the math.
                             emaFrameCounter = 0;
-                            thumb.getPixels(stackPixels, 0, miniW, 0, 0, miniW, miniH);
+                            emaSourceThumb.getPixels(stackPixels, 0, miniW, 0, 0, miniW, miniH);
                             for (int i = 0; i < miniW * miniH; i++) {
                                 int p = stackPixels[i];
                                 int base = i * 3;
@@ -712,6 +912,7 @@ public class CameraActivity extends AppCompatActivity {
                         }
                     } // end !emaHistoryLoading
 
+                    if (emaSourceThumb != null && emaSourceThumb != thumb) emaSourceThumb.recycle();
                     thumb.recycle();
                 }
 
@@ -732,6 +933,8 @@ public class CameraActivity extends AppCompatActivity {
     protected void onDestroy() {
         super.onDestroy();
         timerHandler.removeCallbacks(timerRunnable);
+        timerHandler.removeCallbacks(headlineFetchRunnable);
+        timerHandler.removeCallbacks(headlineScrollRunnable);
 
         if (cameraProvider != null) cameraProvider.unbindAll();
 
@@ -748,6 +951,15 @@ public class CameraActivity extends AppCompatActivity {
             displayExecutor.shutdownNow();
             try {
                 displayExecutor.awaitTermination(500, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        if (headlineExecutor != null) {
+            headlineExecutor.shutdownNow();
+            try {
+                headlineExecutor.awaitTermination(500, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
@@ -797,7 +1009,7 @@ public class CameraActivity extends AppCompatActivity {
             return;
         }
         if (mode.name.equals("Proxima Centauri")) {
-            updateProximaBarcode(thumb);
+            updateProximaBarcode();
             return;
         }
 
@@ -940,11 +1152,38 @@ public class CameraActivity extends AppCompatActivity {
     }
 
     /**
+     * Decodes FrameBuffer's most recently promoted Proxima winner file into a miniW x miniH
+     * thumbnail, using the same downsample-then-scale approach as initEmaFromHistory(). The
+     * winner may have been captured anywhere in the just-closed storageIntervalMs window, so
+     * this must be re-decoded from disk rather than reusing the live ~1s candidate sample.
+     * Returns null if there's no promoted file yet or decoding fails. Caller must recycle.
+     */
+    private Bitmap decodeProximaWinnerThumb() {
+        File winner = frameBuffer.getLastPromotedFile();
+        if (winner == null) return null;
+
+        int sampleSize = 1;
+        while (sampleSize * 2 * miniW <= mode.targetWidth) sampleSize *= 2;
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inSampleSize = sampleSize;
+
+        Bitmap decoded = BitmapFactory.decodeFile(winner.getAbsolutePath(), opts);
+        if (decoded == null) return null;
+
+        if (decoded.getWidth() == miniW && decoded.getHeight() == miniH) {
+            return decoded;
+        }
+        Bitmap scaled = Bitmap.createScaledBitmap(decoded, miniW, miniH, true);
+        decoded.recycle();
+        return scaled;
+    }
+
+    /**
      * Proxima Centauri barcode: maps wall-clock position to (yearRow, xPos) and draws a
      * 24-pixel-tall vertical slit. Year 1 is the bottom row; Year 5 is the top row.
      * Position within each year is proportional to elapsed time within that year.
      */
-    private void updateProximaBarcode(Bitmap thumb) {
+    private void updateProximaBarcode() {
         // Only advance the barcode when a new permanent winner has been promoted to fileBuffer.
         // This method is called on every candidate sample (1fps), but permanent frames are
         // promoted only once per storageIntervalMs (~4.565h), so we must gate on the count.
@@ -952,8 +1191,13 @@ public class CameraActivity extends AppCompatActivity {
         if (currentCount <= proximaLastKnownFileCount) return;
         proximaLastKnownFileCount = currentCount;
 
+        // Use the actual promoted winner's pixels, not the live candidate sample from this
+        // tick — the winner may have been captured anywhere earlier in the closed window.
+        Bitmap winnerThumb = decodeProximaWinnerThumb();
+        if (winnerThumb == null) return;
+
         long firstMs = frameBuffer.getFirstFrameTimeMs();
-        if (firstMs == 0) return;
+        if (firstMs == 0) { winnerThumb.recycle(); return; }
         long elapsedMs = System.currentTimeMillis() - firstMs;
         long yearMs = (long)(365.25 * 24 * 3600 * 1000);
         int yearIndex = (int) Math.min(elapsedMs / yearMs, 4); // 0 = year 1 (bottom)
@@ -966,7 +1210,8 @@ public class CameraActivity extends AppCompatActivity {
         // Extract center 24 rows from thumbnail and average across width
         int slitStartY = (miniH - rowH) / 2;
         int[] scratch24 = new int[miniW * rowH];
-        thumb.getPixels(scratch24, 0, miniW, 0, slitStartY, miniW, rowH);
+        winnerThumb.getPixels(scratch24, 0, miniW, 0, slitStartY, miniW, rowH);
+        winnerThumb.recycle();
         int[] slit24 = new int[rowH];
         for (int row = 0; row < rowH; row++) {
             long r = 0, g = 0, b = 0;
@@ -1205,6 +1450,7 @@ public class CameraActivity extends AppCompatActivity {
         // Set the live-update cursor so new frames continue from the right edge of history.
         proximaBarcodeNextX = rowNextX[0];
         proximaLastKnownFileCount = frameBuffer.getBufferedFrameCount();
+        proximaLastKnownEmaCount = frameBuffer.getBufferedFrameCount();
         Log.d(TAG, "PROXIMA_BARCODE: slit placement done — nullSlits=" + nullSlitCount
                 + " skippedNeg=" + skippedNegative + " proximaBarcodeNextX=" + proximaBarcodeNextX);
         for (int yi = 0; yi < 5; yi++) {

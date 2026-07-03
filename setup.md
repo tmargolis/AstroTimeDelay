@@ -200,6 +200,13 @@ find "./AndroidTimeDelayBackup/Proxima Centauri_YYYY-MM-DD_HH-MM-SS" -type f | w
 
 The local count should match the count from the tablet.
 
+### Backup only certain files:
+
+```bash
+adb shell "tar cf - '/sdcard/Android/data/com.toddmargolis.astroandroidapp/files/AstroTimeDelay/Proxima Centauri_2026-04-11_10-54-26/2026.06'*" \
+| tar xf - --strip-components=7 -C '/Users/todd/Pictures/AndroidTimeDelay/Proxima Centauri_2026-04-11_10-54-26/'
+```
+
 ## Troubleshooting
 
 If `adb pull` copies fewer files than expected, confirm that the source path points to the full session folder rather than a subfolder such as `candidates/`.

@@ -71,6 +71,11 @@ public class FrameBuffer {
     private final int thumbH;
     private final float emaAlpha; // passed through to CameraActivity for EMA stack init
 
+    // Reusable scratch buffers for calculateMotionScore()'s bulk getPixels() reads — avoids
+    // allocating two thumbW*thumbH int[] arrays on every call (up to ~15/sec for Sun mode).
+    private final int[] motionScoreCurrentPixels;
+    private final int[] motionScorePreviousPixels;
+
     // -------------------------------------------------------------------------
     // RAM storage path (fallback — not used by any current mode)
     // -------------------------------------------------------------------------
@@ -88,6 +93,10 @@ public class FrameBuffer {
     // Only invalidated when fileBuffer.peek() advances to a new file.
     private Bitmap cachedFrame;
     private File cachedFile;
+
+    // Reused across getDelayedFrame()'s decodeFile() calls (single-threaded — displayExecutor
+    // only) so BitmapFactory doesn't log "Null Options, creating a new one" on every decode.
+    private final BitmapFactory.Options delayedFrameDecodeOptions = new BitmapFactory.Options();
 
     private Bitmap lastStoredThumb; // deep copy of the most recent stored frame's thumbnail,
                                     // used by getLatestThumbnail() for presence detection
@@ -132,6 +141,7 @@ public class FrameBuffer {
     private long proximaWindowStartMs = 0;   // wall-clock start of the current storageIntervalMs window
     private List<File> proximaCandidates = new ArrayList<>();
     private File proximaCandidatesDir = null; // sessionDir/candidates/ — temp files for current window
+    private volatile File lastPromotedFile = null; // winner file from the most recent selectBestProximaFrame()
 
     // -------------------------------------------------------------------------
     // Session persistence
@@ -156,6 +166,8 @@ public class FrameBuffer {
         this.mode = mode;
         this.thumbW = thumbW;
         this.thumbH = thumbH;
+        this.motionScoreCurrentPixels = new int[thumbW * thumbH];
+        this.motionScorePreviousPixels = new int[thumbW * thumbH];
         this.frameSkip = Math.max(1, mode.targetFps / mode.bufferFps);
         // maxFrames is informational only — used in the log below; actual eviction is time-based
         int maxFrames = (int) (mode.delaySeconds * mode.bufferFps) + 1;
@@ -368,6 +380,15 @@ public class FrameBuffer {
 
     public synchronized int getBufferedFrameCount() {
         return fileBuffer == null ? 0 : fileBuffer.size();
+    }
+
+    /**
+     * The winner file from the most recent selectBestProximaFrame() promotion, or null if
+     * none has been promoted yet this session. Callers should pair this with
+     * getBufferedFrameCount() to detect when a new promotion has actually happened.
+     */
+    public File getLastPromotedFile() {
+        return lastPromotedFile;
     }
 
     /** EMA blending coefficient, passed through from CelestialMode for the ghost stack init. */
@@ -698,6 +719,7 @@ public class FrameBuffer {
                 diskTimestampBuffer.add(winnerTs);
                 saveCheckpoint();
             }
+            lastPromotedFile = winnerDest;
             Log.d(TAG, "Proxima winner added to fileBuffer: " + winnerDest.getName());
         }
 
@@ -731,6 +753,10 @@ public class FrameBuffer {
         }
     }
 
+    // Bounds getDelayedFrame()'s drop-and-retry loop so a run of consecutive missing/corrupt
+    // files (e.g. after a restore mismatch) can't block the display thread indefinitely.
+    private static final int MAX_UNREADABLE_FRAME_SKIPS = 10;
+
     /**
      * Returns the oldest buffered frame — the one that should be displayed now.
      *
@@ -738,6 +764,13 @@ public class FrameBuffer {
      * (cachedFrame / cachedFile) avoids re-decoding the same file on consecutive display
      * ticks when no new permanent frame has been promoted. Cache is invalidated when
      * fileBuffer.peek() returns a different file (i.e., addFrameToDisk evicted the head).
+     *
+     * If a file fails to decode (e.g. it's missing from disk — can happen after a restore
+     * mismatch, such as a crash/redeploy interrupting a write), that entry is dropped from
+     * fileBuffer/diskTimestampBuffer and the next one is tried, up to MAX_UNREADABLE_FRAME_SKIPS
+     * attempts. Without this, a single bad entry would otherwise sit at the head forever,
+     * retried (and re-logged as a decode failure) on every display tick until enough new
+     * frames arrive for ordinary time-based eviction to happen to push past it.
      *
      * The JPEG decode is intentionally outside the synchronized block — it takes 50–200 ms
      * and must not block the camera thread. The synchronized block only reads/writes the
@@ -752,28 +785,43 @@ public class FrameBuffer {
     public Bitmap getDelayedFrame() {
         if (released) return null;
         if (mode.useCompression) {
-            // Snapshot head file and check cache under lock (fast — no I/O).
-            // Must be synchronized against addFrameToDisk() which evicts from the same deques.
-            File file;
-            synchronized (this) {
-                file = fileBuffer.peek();
-                if (file != null && file.equals(cachedFile)
-                        && cachedFrame != null && !cachedFrame.isRecycled()) {
-                    return cachedFrame; // cache hit — already decoded, no disk read needed
+            for (int attempt = 0; attempt < MAX_UNREADABLE_FRAME_SKIPS; attempt++) {
+                // Snapshot head file and check cache under lock (fast — no I/O).
+                // Must be synchronized against addFrameToDisk() which evicts from the same deques.
+                File file;
+                synchronized (this) {
+                    file = fileBuffer.peek();
+                    if (file != null && file.equals(cachedFile)
+                            && cachedFrame != null && !cachedFrame.isRecycled()) {
+                        return cachedFrame; // cache hit — already decoded, no disk read needed
+                    }
                 }
-            }
-            if (file == null) return null;
+                if (file == null) return cachedFrame; // buffer empty — fall back to last-known frame
 
-            // Cache miss — decode outside lock (50-200 ms; must not block camera thread).
-            Bitmap decoded = BitmapFactory.decodeFile(file.getAbsolutePath());
+                // Cache miss — decode outside lock (50-200 ms; must not block camera thread).
+                Bitmap decoded = BitmapFactory.decodeFile(file.getAbsolutePath(), delayedFrameDecodeOptions);
 
-            synchronized (this) {
                 if (decoded != null) {
-                    if (cachedFrame != null && !cachedFrame.isRecycled()) cachedFrame.recycle();
-                    cachedFrame = decoded;
-                    cachedFile = file;
+                    synchronized (this) {
+                        if (cachedFrame != null && !cachedFrame.isRecycled()) cachedFrame.recycle();
+                        cachedFrame = decoded;
+                        cachedFile = file;
+                    }
+                    return cachedFrame;
                 }
-                // Return cached frame even if decode failed (file may have been evicted mid-decode).
+
+                // Decode failed — drop this entry (only if it's still the head; a concurrent
+                // addFrameToDisk() eviction may have already moved past it) and try the next one.
+                synchronized (this) {
+                    if (fileBuffer.peek() == file) {
+                        fileBuffer.poll();
+                        diskTimestampBuffer.poll();
+                    }
+                }
+                Log.w(TAG, "Dropped unreadable buffered frame: " + file.getName());
+            }
+            synchronized (this) {
+                // Exhausted retries — fall back to whatever was last successfully decoded.
                 return cachedFrame;
             }
         } else {
@@ -807,36 +855,40 @@ public class FrameBuffer {
      */
     private float calculateMotionScore(Bitmap currentThumb, Bitmap previousThumb) {
         if (currentThumb == null || previousThumb == null) return 0.0f;
-        
+
         int width = currentThumb.getWidth();
         int height = currentThumb.getHeight();
         int totalPixels = width * height;
+
+        // Bulk-read both bitmaps in one JNI call each instead of calling getPixel() per pixel
+        // (that was ~2x totalPixels individual JNI transitions — up to 15x/sec for Sun mode).
+        int[] currentPixels = motionScoreCurrentPixels;
+        int[] previousPixels = motionScorePreviousPixels;
+        currentThumb.getPixels(currentPixels, 0, width, 0, 0, width, height);
+        previousThumb.getPixels(previousPixels, 0, width, 0, 0, width, height);
+
         int changedPixels = 0;
-        
-        // Using a simple scan approach for better performance
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int currentPixel = currentThumb.getPixel(x, y);
-                int previousPixel = previousThumb.getPixel(x, y);
-                
-                // Convert to luma using fast approximation: (r * 77 + g * 150 + b * 29) >> 8
-                int currentR = (currentPixel >> 16) & 0xFF;
-                int currentG = (currentPixel >> 8) & 0xFF;
-                int currentB = currentPixel & 0xFF;
-                
-                int previousR = (previousPixel >> 16) & 0xFF;
-                int previousG = (previousPixel >> 8) & 0xFF;
-                int previousB = previousPixel & 0xFF;
-                
-                // Calculate luma for both pixels
-                int currentLuma = (currentR * 77 + currentG * 150 + currentB * 29) >> 8;
-                int previousLuma = (previousR * 77 + previousG * 150 + previousB * 29) >> 8;
-                
-                // Calculate absolute difference
-                int delta = Math.abs(currentLuma - previousLuma);
-                if (delta >= LUMA_DELTA_THRESHOLD) {
-                    changedPixels++;
-                }
+        for (int i = 0; i < totalPixels; i++) {
+            int currentPixel = currentPixels[i];
+            int previousPixel = previousPixels[i];
+
+            // Convert to luma using fast approximation: (r * 77 + g * 150 + b * 29) >> 8
+            int currentR = (currentPixel >> 16) & 0xFF;
+            int currentG = (currentPixel >> 8) & 0xFF;
+            int currentB = currentPixel & 0xFF;
+
+            int previousR = (previousPixel >> 16) & 0xFF;
+            int previousG = (previousPixel >> 8) & 0xFF;
+            int previousB = previousPixel & 0xFF;
+
+            // Calculate luma for both pixels
+            int currentLuma = (currentR * 77 + currentG * 150 + currentB * 29) >> 8;
+            int previousLuma = (previousR * 77 + previousG * 150 + previousB * 29) >> 8;
+
+            // Calculate absolute difference
+            int delta = Math.abs(currentLuma - previousLuma);
+            if (delta >= LUMA_DELTA_THRESHOLD) {
+                changedPixels++;
             }
         }
 

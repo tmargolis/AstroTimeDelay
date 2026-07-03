@@ -160,9 +160,10 @@ public class OverlayRenderer {
      * known until CameraX delivers the first frame).
      *
      * Positioning rules per mode:
-     *   Saturn         — native pixel size (512×512), top-left corner. No scaling.
-     *   Moon           — scaled to 50% of the "fit" size, centered in the frame.
-     *   Sun/Proxima    — scaled to fit the full frame (longest edge fills the frame), top-left.
+     *   Saturn — native pixel size (512×512), top-left corner. No scaling.
+     *   Sun    — native pixel size (total.png, 500×500), inset 100px from the top-left corner.
+     *   Moon   — scaled to 50% of the "fit" size, centered in the frame.
+     *   Proxima — scaled to fit the full frame (longest edge fills the frame), centered.
      */
     private void initScaledOverlay(int frameW, int frameH) {
         if (mode.name.equals("Saturn")) {
@@ -172,6 +173,14 @@ public class OverlayRenderer {
             scaledOverlayImage = overlayImage;
             overlayLeft = 0;
             overlayTop  = 0;
+        } else if (mode.name.equals("Sun")) {
+            // Sun overlay (total.png, 500×500) is scaled to 50% and inset from the
+            // top-left corner rather than filling the frame edge-to-edge.
+            int scaledW = overlayImage.getWidth() / 2;
+            int scaledH = overlayImage.getHeight() / 2;
+            scaledOverlayImage = Bitmap.createScaledBitmap(overlayImage, scaledW, scaledH, true);
+            overlayLeft = 100;
+            overlayTop  = 100;
         } else {
             // Compute the scale factor that fits the image within the frame (aspect-correct).
             float scale = Math.min(
@@ -185,10 +194,9 @@ public class OverlayRenderer {
             int scaledH = (int)(overlayImage.getHeight() * scale);
             scaledOverlayImage = Bitmap.createScaledBitmap(overlayImage, scaledW, scaledH, true);
 
-            // Sun/Proxima: top-left aligned (the overlay fills the frame edge-to-edge).
-            // Moon: centered so the disc sits in the middle of the reflection.
-            overlayLeft = mode.name.equals("Sun") ? 0 : (frameW - scaledW) / 2;
-            overlayTop  = mode.name.equals("Sun") ? 0 : (frameH - scaledH) / 2;
+            // Moon/Proxima: centered in the frame.
+            overlayLeft = (frameW - scaledW) / 2;
+            overlayTop  = (frameH - scaledH) / 2;
         }
         Log.d(TAG, "Overlay scaled: " + scaledOverlayImage.getWidth()
                 + "x" + scaledOverlayImage.getHeight()

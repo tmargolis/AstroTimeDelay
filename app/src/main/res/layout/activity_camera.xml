@@ -67,6 +67,73 @@
         android:alpha="0.7"
         android:visibility="gone" />
 
+    <!-- Proxima Centauri only: fixed date label + fading topic label on the top line, with a
+         full-width scrolling ticker of Wikipedia Current Events leaf headlines from the
+         lookback date on the line below. Bottom margin is set in code to sit above
+         queuingLabel so the two never overlap during the (years-long) queueing phase. Hidden
+         for all other modes. -->
+    <LinearLayout
+        android:id="@+id/headlineRow"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <!-- Fixed, non-scrolling label showing the lookback date, e.g. "February 18, 2022: " -->
+            <TextView
+                android:id="@+id/headlineDateLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="#FFE0FFFF"
+                android:textSize="16sp"
+                android:paddingStart="8dp"
+                android:paddingTop="8dp"
+                android:fontFamily="monospace"
+                android:singleLine="true" />
+
+            <!-- Topic of the headline currently entering the ticker's right edge, positioned
+                 right after the date. Cross-fades in code: old topic fades out, then the new
+                 one fades in, timed to when its sentence starts scrolling into view. Starts
+                 invisible (alpha 0) until the first topic. -->
+            <TextView
+                android:id="@+id/headlineTopicLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="#FFE0FFFF"
+                android:textSize="16sp"
+                android:paddingTop="8dp"
+                android:fontFamily="monospace"
+                android:singleLine="true"
+                android:alpha="0" />
+
+        </LinearLayout>
+
+        <!-- Scrolling headline ticker (sentences only), full screen width. Scrolled manually
+             via View.scrollTo() in code so playback position can be synchronized with
+             headlineTopicLabel's crossfade above. -->
+        <TextView
+            android:id="@+id/headlineTicker"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="#FFE0FFFF"
+            android:textSize="16sp"
+            android:paddingStart="8dp"
+            android:paddingEnd="8dp"
+            android:paddingBottom="8dp"
+            android:fontFamily="monospace"
+            android:singleLine="true"
+            android:scrollHorizontally="true"
+            android:requiresFadingEdge="horizontal"
+            android:fadingEdgeLength="24dp" />
+
+    </LinearLayout>
+
     <!-- Mode name at top-center of screen, above the celestial overlay. -->
     <TextView
         android:id="@+id/modeNameLabel"
