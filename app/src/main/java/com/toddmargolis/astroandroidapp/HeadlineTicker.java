@@ -71,9 +71,9 @@ class HeadlineTicker {
                 + "_" + date.get(Calendar.DAY_OF_MONTH);
     }
 
-    /** Fixed date label shown to the left of the ticker, e.g. "February 18, 2022: ". */
+    /** Fixed date label shown to the left of the ticker, e.g. "On February 18, 2022: ". */
     static String formatDateLabel(Calendar date) {
-        return MONTH_NAMES[date.get(Calendar.MONTH)] + " " + date.get(Calendar.DAY_OF_MONTH)
+        return "On " + MONTH_NAMES[date.get(Calendar.MONTH)] + " " + date.get(Calendar.DAY_OF_MONTH)
                 + ", " + date.get(Calendar.YEAR) + ": ";
     }
 

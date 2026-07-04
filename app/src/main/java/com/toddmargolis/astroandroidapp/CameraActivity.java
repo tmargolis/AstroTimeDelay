@@ -72,6 +72,9 @@ import java.util.concurrent.TimeUnit;
  */
 public class CameraActivity extends AppCompatActivity {
     private static final String TAG = "CameraActivity";
+    private static final String[] MONTH_ABBREV = {
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
 
     // -------------------------------------------------------------------------
     // Core pipeline objects
@@ -113,17 +116,22 @@ public class CameraActivity extends AppCompatActivity {
             timerHandler.postDelayed(this, 24L * 60 * 60 * 1000);
         }
     };
+    // Written by fetchAndUpdateHeadlines() (headlineExecutor thread), read by
+    // checkForLookbackDayRollover() (main thread via headlineScrollRunnable) — volatile
+    // for cross-thread visibility. Encodes year*1000+dayOfYear of the last fetch attempt.
+    private volatile int lastFetchedLookbackDayId = -1;
 
     private List<HeadlineTicker.HeadlineItem> headlineItems = new ArrayList<>();
     private int[] headlineItemStartPx = new int[0]; // pixel x-offset of each item's sentence
     private int headlineLoopWidthPx = 0;            // width of one full loop, incl. trailing gap
     private int headlineScrollX = 0;
     private int headlineCurrentTopicIndex = -1;
-    private static final String HEADLINE_GAP = "   ";
-    private static final int HEADLINE_SCROLL_INTERVAL_MS = 33; // ~30fps
-    private static final int HEADLINE_SCROLL_STEP_PX = 2;      // ~60px/s
+    private static final String HEADLINE_GAP = "  /  ";
+    private static final int HEADLINE_SCROLL_INTERVAL_MS = 15;
+    private static final int HEADLINE_SCROLL_STEP_PX = 2;
     private final Runnable headlineScrollRunnable = new Runnable() {
         @Override public void run() {
+            checkForLookbackDayRollover();
             advanceHeadlineScroll();
             timerHandler.postDelayed(this, HEADLINE_SCROLL_INTERVAL_MS);
         }
@@ -180,7 +188,8 @@ public class CameraActivity extends AppCompatActivity {
     private float barcodeHistorySeconds;  // seconds of history the full barcode width represents
     private volatile boolean barcodeHistoryLoading = false; // true while initBarcodeFromHistory() runs
     private volatile boolean emaHistoryLoading = false;     // true while initEmaFromHistory() runs
-    private int proximaBarcodeNextX = 0;        // next sequential x position for Proxima barcode (bottom row)
+    private int proximaBarcodeLeftInset = 0;    // px reserved on the left of the barcode for "Y1".."Y5" row labels
+    private float[] proximaRowNextX = new float[5]; // fractional next-x per year row (index 0 = year 1, bottom row)
     private int proximaLastKnownFileCount = 0;  // fileBuffer.size() when we last drew a barcode slit
     private int proximaLastKnownEmaCount = 0;   // fileBuffer.size() when the EMA ghost last updated
 
@@ -234,6 +243,7 @@ public class CameraActivity extends AppCompatActivity {
         headlineDateLabel = findViewById(R.id.headlineDateLabel);
         headlineTicker = findViewById(R.id.headlineTicker); // Proxima Centauri lookback-date headlines
         headlineTopicLabel = findViewById(R.id.headlineTopicLabel);
+        headlineTopicLabel.setPaintFlags(headlineTopicLabel.getPaintFlags() | Paint.UNDERLINE_TEXT_FLAG);
 
         LinearLayout bottomLabelRow = findViewById(R.id.bottomLabelRow);
         modeNameLabel = findViewById(R.id.modeNameLabel); // Moon, Sun, Saturn eg "Moon / 1.3 second delay"
@@ -334,6 +344,16 @@ public class CameraActivity extends AppCompatActivity {
         // 1920×1080, leaving exactly 120px at the bottom — the barcode fills that gap.
         barcodeH = 120;
 
+        if (mode.name.equals("Proxima Centauri")) {
+            // Reserve enough left margin that the "Y1".."Y5" row labels (drawn at x=4 in
+            // updateLayoutForPhase()) never sit under barcode slit content — measured from
+            // the same text size used there rather than a guessed constant.
+            Paint yearLabelMeasure = new Paint();
+            yearLabelMeasure.setTextSize(12 * dm.density);
+            float maxLabelW = yearLabelMeasure.measureText("Y5");
+            proximaBarcodeLeftInset = (int) (4 + maxLabelW + 8 * dm.density);
+        }
+
         // Use the mode's declared barcode window if set, otherwise use the delay.
         // Moon overrides this to 10s so the barcode shows 10s of history rather than 1.3s.
         barcodeHistorySeconds = mode.barcodeHistorySeconds > 0 ? mode.barcodeHistorySeconds : mode.delaySeconds;
@@ -385,14 +405,21 @@ public class CameraActivity extends AppCompatActivity {
             // Position the ticker above queuingLabel's rendered height (computed from its
             // fixed 48sp text size, not measured live — queuingLabel starts GONE, so it
             // wouldn't be laid out yet) so the two never overlap during the years-long
-            // queueing phase.
+            // queueing phase. Uses a tight glyph bounding box (getTextBounds) rather than
+            // FontMetrics' ascent-to-descent span, which is a generic line-height figure
+            // that noticeably overestimates the visual height of an all-caps, no-descender
+            // string like "QUEUEING" and was showing up as extra gap above the ticker.
             Paint queuingMeasure = new Paint();
             queuingMeasure.setTextSize(48 * getResources().getDisplayMetrics().scaledDensity);
-            Paint.FontMetrics fm = queuingMeasure.getFontMetrics();
-            int queuingLabelH = (int) Math.ceil(fm.bottom - fm.top);
+            Rect queuingBounds = new Rect();
+            queuingMeasure.getTextBounds("QUEUEING", 0, "QUEUEING".length(), queuingBounds);
+            int queuingLabelH = queuingBounds.height();
+
+            // Small extra lift on top of the measured height, to taste.
+            int extraLiftPx = (int) (8 * getResources().getDisplayMetrics().density);
 
             FrameLayout.LayoutParams rowLp2 = (FrameLayout.LayoutParams) headlineRow.getLayoutParams();
-            rowLp2.bottomMargin = barcodeH + queuingLabelH;
+            rowLp2.bottomMargin = barcodeH + queuingLabelH + extraLiftPx;
             headlineRow.setLayoutParams(rowLp2);
 
             headlineRow.setVisibility(View.VISIBLE);
@@ -410,9 +437,13 @@ public class CameraActivity extends AppCompatActivity {
             if (!cachedItems.isEmpty()) applyHeadlineItems(cachedItems);
             if (cachedDateLabel != null) headlineDateLabel.setText(cachedDateLabel);
 
+            // Claim today's lookback day before dispatching, so the rollover check (which
+            // starts ticking a couple lines below) doesn't race the executor thread startup
+            // and dispatch a redundant duplicate fetch.
+            lastFetchedLookbackDayId = dayId(HeadlineTicker.lookbackDate(mode.delaySeconds));
             headlineExecutor.execute(() -> fetchAndUpdateHeadlines()); // populate/refresh immediately
             scheduleHeadlineFetch(); // then daily at local midnight thereafter
-            timerHandler.post(headlineScrollRunnable);
+            timerHandler.post(headlineScrollRunnable); // also self-heals via checkForLookbackDayRollover()
         }
 
 
@@ -530,16 +561,44 @@ public class CameraActivity extends AppCompatActivity {
         nextMidnight.set(Calendar.SECOND, 0);
         nextMidnight.set(Calendar.MILLISECOND, 0);
         long delay = nextMidnight.getTimeInMillis() - System.currentTimeMillis();
+        Log.d(TAG, "Headline fetch scheduled to fire in " + (delay / 1000) + "s");
         timerHandler.postDelayed(headlineFetchRunnable, delay);
+    }
+
+    /** Encodes a Calendar's date as year*1000+dayOfYear — unique and monotonically ordered. */
+    private int dayId(Calendar cal) {
+        return cal.get(Calendar.YEAR) * 1000 + cal.get(Calendar.DAY_OF_YEAR);
+    }
+
+    /**
+     * Self-healing safety net for the daily headline refresh. scheduleHeadlineFetch()'s single
+     * Handler.postDelayed() (up to 24h out) is the primary trigger, but a lone scheduled
+     * callback has no retry if it's ever missed — e.g. a crash/restart racing with the
+     * scheduled moment, or the main thread being busy right then. This runs every
+     * HEADLINE_SCROLL_INTERVAL_MS alongside the scroll loop and catches up within one tick
+     * if the lookback date has moved on without a fetch actually happening for it.
+     */
+    private void checkForLookbackDayRollover() {
+        int currentDay = dayId(HeadlineTicker.lookbackDate(mode.delaySeconds));
+        if (currentDay != lastFetchedLookbackDayId) {
+            headlineExecutor.execute(() -> fetchAndUpdateHeadlines());
+        }
     }
 
     /** Runs on headlineExecutor. Fetches the lookback date's headlines and updates the ticker. */
     private void fetchAndUpdateHeadlines() {
         Calendar lookback = HeadlineTicker.lookbackDate(mode.delaySeconds);
+        // Claim this day immediately (before the slow network call) so a near-simultaneous
+        // trigger from the other mechanism (scheduled callback vs. rollover check) doesn't
+        // also fire — and so a failed fetch doesn't retry in a tight 33ms loop; it'll be
+        // retried at the next actual day rollover or app restart instead.
+        lastFetchedLookbackDayId = dayId(lookback);
         String dateLabel = HeadlineTicker.formatDateLabel(lookback);
+        Log.d(TAG, "Fetching headlines for lookback date: " + dateLabel);
         List<HeadlineTicker.HeadlineItem> items = HeadlineTicker.fetchHeadlines(lookback);
         if (items != null) {
             HeadlineTicker.writeCache(this, items, dateLabel);
+            Log.d(TAG, "Headline fetch succeeded: " + items.size() + " items for " + dateLabel);
             runOnUiThread(() -> {
                 headlineDateLabel.setText(dateLabel);
                 applyHeadlineItems(items);
@@ -691,21 +750,52 @@ public class CameraActivity extends AppCompatActivity {
         textPaint.setAntiAlias(true);
 
         if (mode.name.equals("Proxima Centauri")) {
-            // 5-row grid: each row = 1 year (24px tall), month ticks every barcodeW/12
+            // 5-row grid: each row = 1 year (24px tall), month ticks every usableW/12.
+            // Month ticks and slit content are confined to the right of proximaBarcodeLeftInset
+            // so they never sit under the "Y1".."Y5" labels drawn at the far left of each row.
             int rowH = 24;
+            int usableW = barcodeW - proximaBarcodeLeftInset;
+
+            // Column 0's label is the calendar month the session actually started in (not
+            // always January) — falls back to "now" if no frame has been captured yet, since
+            // a fresh session's first frame lands within moments of this first layout call.
+            // Columns themselves stay equal-width (full months); the fact that recording
+            // started partway through the first month is instead shown as blank space at the
+            // start of the Y1 slit row (see proximaYear1OffsetPx in updateProximaBarcode()/
+            // initProximaBarcodeFromHistory()), not by shrinking this column.
+            long sessionStartMs = frameBuffer.getFirstFrameTimeMs();
+            if (sessionStartMs == 0) sessionStartMs = System.currentTimeMillis();
+            Calendar startCal = Calendar.getInstance();
+            startCal.setTimeInMillis(sessionStartMs);
+            int startMonth = startCal.get(Calendar.MONTH); // 0 = January
+
             for (int row = 0; row < 5; row++) {
                 int year = 5 - row; // bottom row = year 1
                 int rowTop = row * rowH;
-                // Row separator line
+                // Row separator line (spans full width, including under the label column)
                 if (row > 0) tickCanvas.drawLine(0, rowTop, barcodeW, rowTop, tickPaint);
                 // 11 month tick marks within each row
                 for (int mo = 1; mo < 12; mo++) {
-                    float tx = (float) mo / 12f * barcodeW;
+                    float tx = proximaBarcodeLeftInset + (float) mo / 12f * usableW;
                     tickCanvas.drawLine(tx, rowTop, tx, rowTop + rowH, tickPaint);
                 }
                 // Year label at far left of each row
                 String label = "Y" + year;
                 tickCanvas.drawText(label, 4, rowTop + textPaint.getTextSize(), textPaint);
+
+                // Month abbreviations centered in each column, top row (Y5) only.
+                // Column 0 shows the session's actual starting month, wrapping around
+                // through December and back to January for the remaining columns.
+                if (row == 0) {
+                    for (int mo = 0; mo < 12; mo++) {
+                        float colStart = proximaBarcodeLeftInset + (float) mo / 12f * usableW;
+                        float colEnd   = proximaBarcodeLeftInset + (float) (mo + 1) / 12f * usableW;
+                        String monthLabel = MONTH_ABBREV[(startMonth + mo) % 12];
+                        float textW = textPaint.measureText(monthLabel);
+                        float tx = (colStart + colEnd) / 2f - textW / 2f;
+                        tickCanvas.drawText(monthLabel, tx, rowTop + textPaint.getTextSize(), textPaint);
+                    }
+                }
             }
         } else {
             float tickIntervalSec;
@@ -750,7 +840,14 @@ public class CameraActivity extends AppCompatActivity {
             if (years > 0)  timeStr = String.format("%dy %dm %dd", years, months, days);
             else if (months > 0) timeStr = String.format("%dm %dd", months, days);
             else timeStr = String.format("%dd", totalDays);
-            return "buffering for another " + timeStr;
+
+            long firstMs = frameBuffer.getFirstFrameTimeMs();
+            String startedStr = "";
+            if (firstMs != 0) {
+                SimpleDateFormat fmt = new SimpleDateFormat("MM/dd/yy", Locale.US);
+                startedStr = " (started on " + fmt.format(new Date(firstMs)) + ")";
+            }
+            return "buffering for another " + timeStr + startedStr;
         } else if (totalSeconds >= 3600) {
             int h = totalSeconds / 3600;
             int m = (totalSeconds % 3600) / 60;
@@ -1183,6 +1280,28 @@ public class CameraActivity extends AppCompatActivity {
      * 24-pixel-tall vertical slit. Year 1 is the bottom row; Year 5 is the top row.
      * Position within each year is proportional to elapsed time within that year.
      */
+    /**
+     * Pixels of blank space to leave at the start of the Y1 (year 1) slit row, representing
+     * the portion of the first calendar month that had already elapsed before recording
+     * began — e.g. a session starting April 11 leaves ~1/3 of the "Apr" column empty rather
+     * than placing its first slit at the very left edge of that column.
+     */
+    private float proximaYear1OffsetPx(long firstMs, int usableW) {
+        Calendar cal = Calendar.getInstance();
+        cal.setTimeInMillis(firstMs);
+        int daysInMonth = cal.getActualMaximum(Calendar.DAY_OF_MONTH);
+        Calendar firstOfMonth = (Calendar) cal.clone();
+        firstOfMonth.set(Calendar.DAY_OF_MONTH, 1);
+        firstOfMonth.set(Calendar.HOUR_OF_DAY, 0);
+        firstOfMonth.set(Calendar.MINUTE, 0);
+        firstOfMonth.set(Calendar.SECOND, 0);
+        firstOfMonth.set(Calendar.MILLISECOND, 0);
+        long msIntoMonth = firstMs - firstOfMonth.getTimeInMillis();
+        long monthDurationMs = daysInMonth * 24L * 3600 * 1000;
+        float fractionElapsed = msIntoMonth / (float) monthDurationMs;
+        return fractionElapsed * (usableW / 12f);
+    }
+
     private void updateProximaBarcode() {
         // Only advance the barcode when a new permanent winner has been promoted to fileBuffer.
         // This method is called on every candidate sample (1fps), but permanent frames are
@@ -1201,8 +1320,17 @@ public class CameraActivity extends AppCompatActivity {
         long elapsedMs = System.currentTimeMillis() - firstMs;
         long yearMs = (long)(365.25 * 24 * 3600 * 1000);
         int yearIndex = (int) Math.min(elapsedMs / yearMs, 4); // 0 = year 1 (bottom)
-        // Sequential placement: each new permanent frame advances one pixel right, no gaps.
-        int xPos = proximaBarcodeNextX++;
+        // Sequential placement, compressed into the space right of the year-label margin:
+        // a full year is designed to produce ~barcodeW promoted frames, so each one advances
+        // a fraction (usableW/barcodeW) of a pixel rather than a whole pixel — otherwise the
+        // year would overflow past the right edge before December's frames were placed.
+        int usableW = barcodeW - proximaBarcodeLeftInset;
+        float xIncrement = (float) usableW / barcodeW;
+        int xPos = proximaBarcodeLeftInset + (int) proximaRowNextX[yearIndex];
+        // Year 1 only: leave blank space at the start of the row for the part of the first
+        // calendar month that had already elapsed before recording began.
+        if (yearIndex == 0) xPos += (int) proximaYear1OffsetPx(firstMs, usableW);
+        proximaRowNextX[yearIndex] += xIncrement;
         Log.d(TAG, "PROXIMA_BARCODE: live update xPos=" + xPos + " yr=" + yearIndex + " fileCount=" + currentCount);
         int rowH = 24;
         int rowTop = (4 - yearIndex) * rowH; // bitmap y: year1 at y=96, year5 at y=0
@@ -1419,9 +1547,15 @@ public class CameraActivity extends AppCompatActivity {
         long yearMs = (long)(365.25 * 24 * 3600 * 1000);
         int rowH = 24;
 
-        // Sequential x position per year row — each frame gets the next available pixel,
-        // left-to-right, with no gaps regardless of actual capture timestamp spacing.
-        int[] rowNextX = new int[5];
+        // Sequential x position per year row — each frame gets the next available fractional
+        // pixel, left-to-right, with no gaps regardless of actual capture timestamp spacing.
+        // Compressed into the space right of the year-label margin (see proximaBarcodeLeftInset),
+        // matching the live-update path in updateProximaBarcode() so restored and freshly-drawn
+        // slits use the same mapping.
+        int usableW = barcodeW - proximaBarcodeLeftInset;
+        float xIncrement = (float) usableW / barcodeW;
+        float year1OffsetPx = proximaYear1OffsetPx(firstMs, usableW);
+        float[] rowNextX = new float[5];
 
         int nullSlitCount = 0;
         int skippedNegative = 0;
@@ -1431,7 +1565,10 @@ public class CameraActivity extends AppCompatActivity {
             long elapsedMs = ts - firstMs;
             if (elapsedMs < 0) { skippedNegative++; continue; }
             int yearIndex = (int) Math.min(elapsedMs / yearMs, 4);
-            int xPos = rowNextX[yearIndex]; // sequential — no timestamp math, no gaps
+            int xPos = proximaBarcodeLeftInset + (int) rowNextX[yearIndex]; // sequential — no timestamp math, no gaps
+            // Year 1 only: leave blank space at the start of the row for the part of the
+            // first calendar month that had already elapsed before recording began.
+            if (yearIndex == 0) xPos += (int) year1OffsetPx;
             int rowTop = (4 - yearIndex) * rowH;
             int[] slit = decodeFileToProximaSlit(sortedFiles.get(fi), rowH);
             if (slit == null) {
@@ -1439,7 +1576,7 @@ public class CameraActivity extends AppCompatActivity {
                 Log.w(TAG, "PROXIMA_BARCODE: null slit for " + sortedFiles.get(fi).getName() + " yr=" + yearIndex + " xPos=" + xPos);
             } else if (xPos < barcodeW) {
                 workBmp.setPixels(slit, 0, 1, xPos, rowTop, 1, rowH);
-                rowNextX[yearIndex]++;
+                rowNextX[yearIndex] += xIncrement;
                 rowSlitCount[yearIndex]++;
                 Log.d(TAG, "PROXIMA_BARCODE: placed fi=" + fi + " file=" + sortedFiles.get(fi).getName()
                         + " yr=" + yearIndex + " xPos=" + xPos);
@@ -1447,12 +1584,13 @@ public class CameraActivity extends AppCompatActivity {
                 Log.w(TAG, "PROXIMA_BARCODE: xPos beyond barcodeW for " + sortedFiles.get(fi).getName());
             }
         }
-        // Set the live-update cursor so new frames continue from the right edge of history.
-        proximaBarcodeNextX = rowNextX[0];
+        // Carry every row's cursor forward for live updates (not just row 0) so placement
+        // stays correct if the app keeps running across a year boundary without a restart.
+        proximaRowNextX = rowNextX;
         proximaLastKnownFileCount = frameBuffer.getBufferedFrameCount();
         proximaLastKnownEmaCount = frameBuffer.getBufferedFrameCount();
         Log.d(TAG, "PROXIMA_BARCODE: slit placement done — nullSlits=" + nullSlitCount
-                + " skippedNeg=" + skippedNegative + " proximaBarcodeNextX=" + proximaBarcodeNextX);
+                + " skippedNeg=" + skippedNegative + " row0NextX=" + rowNextX[0]);
         for (int yi = 0; yi < 5; yi++) {
             Log.d(TAG, "PROXIMA_BARCODE: row yi=" + yi + " slits=" + rowSlitCount[yi]
                     + " nextX=" + rowNextX[yi]);
