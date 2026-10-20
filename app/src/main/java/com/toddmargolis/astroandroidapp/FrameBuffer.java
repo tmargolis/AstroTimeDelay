@@ -143,6 +143,7 @@ public class FrameBuffer {
     private List<File> proximaCandidates = new ArrayList<>();
     private File proximaCandidatesDir = null; // sessionDir/candidates/ — temp files for current window
     private volatile File lastPromotedFile = null; // winner file from the most recent selectBestProximaFrame()
+    private volatile File lastCandidateFile = null; // candidate JPEG written by the most recent sample (null if the write failed)
 
     // -------------------------------------------------------------------------
     // Session persistence
@@ -392,6 +393,15 @@ public class FrameBuffer {
         return lastPromotedFile;
     }
 
+    /**
+     * The candidate JPEG written by the most recent Proxima sample, or null if that write
+     * failed. Valid right after addFrame() returns a thumbnail in Proxima mode; the file stays
+     * in candidates/ until its window closes (or moves to sessionDir if it wins).
+     */
+    public File getLastCandidateFile() {
+        return lastCandidateFile;
+    }
+
     /** EMA blending coefficient, passed through from CelestialMode for the ghost stack init. */
     public float getEmaAlpha() { return emaAlpha; }
 
@@ -625,6 +635,7 @@ public class FrameBuffer {
         // Write candidate to candidates/ dir with score embedded in the filename
         if (proximaCandidatesDir != null) {
             File candidate = writeProximaCandidate(bitmap, nowMs, score);
+            lastCandidateFile = candidate;
             if (candidate != null) {
                 proximaCandidates.add(candidate);
                 Log.d(TAG, "Proxima sample: score=" + String.format(Locale.US, "%.5f", score)

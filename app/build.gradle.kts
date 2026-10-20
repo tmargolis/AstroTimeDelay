@@ -1,6 +1,16 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
 }
+
+// Motion alert settings live in the untracked local.properties so the secret and topic
+// never land in git. Missing keys build as "" and leave alerts disabled.
+val localProps = Properties().apply {
+    val file = rootProject.file("local.properties")
+    if (file.exists()) file.inputStream().use { load(it) }
+}
+fun localString(key: String): String = "\"${localProps.getProperty(key, "").trim()}\""
 
 android {
     namespace = "com.toddmargolis.astroandroidapp"
@@ -17,6 +27,14 @@ android {
 
         renderscriptTargetApi = 21
         renderscriptSupportModeEnabled = true
+
+        buildConfigField("String", "ALERT_UPLOAD_URL", localString("alert.uploadUrl"))
+        buildConfigField("String", "ALERT_SECRET", localString("alert.secret"))
+        buildConfigField("String", "ALERT_NTFY_TOPIC", localString("alert.ntfyTopic"))
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     buildTypes {
@@ -54,7 +72,4 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$camerax_version")
     implementation("androidx.camera:camera-view:$camerax_version")
     implementation("androidx.camera:camera-core:$camerax_version")
-
-    // ML Kit Object Detection
-    implementation("com.google.mlkit:object-detection:17.0.2")
 }

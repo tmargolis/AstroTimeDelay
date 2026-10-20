@@ -37,8 +37,6 @@ import androidx.camera.core.ImageProxy;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.core.content.ContextCompat;
 
-import com.google.android.gms.tasks.OnFailureListener;
-import com.google.android.gms.tasks.OnSuccessListener;
 import com.google.common.util.concurrent.ListenableFuture;
 
 import java.io.File;
@@ -116,6 +114,7 @@ public class CameraActivity extends AppCompatActivity {
     private TextView headlineTicker;         // manually scrolled via scrollTo(), not marquee
     private TextView headlineTopicLabel;     // fades between topics as the ticker scrolls
     private ExecutorService headlineExecutor; // single thread for the daily network fetch
+    private MotionAlerter motionAlerter;      // Proxima only; null when alerts aren't configured
     private final Runnable headlineFetchRunnable = new Runnable() {
         @Override public void run() {
             headlineExecutor.execute(() -> fetchAndUpdateHeadlines());
@@ -466,6 +465,8 @@ public class CameraActivity extends AppCompatActivity {
             headlineExecutor.execute(() -> fetchAndUpdateHeadlines()); // populate/refresh immediately
             scheduleHeadlineFetch(); // then daily at local midnight thereafter
             timerHandler.post(headlineScrollRunnable); // also self-heals via checkForLookbackDayRollover()
+
+            motionAlerter = MotionAlerter.createIfConfigured(mode.name);
         }
 
 
@@ -1019,6 +1020,13 @@ public class CameraActivity extends AppCompatActivity {
                         updateScreenBrightness(true); // dim after inactivity timeout
                     }
 
+                    // In Proxima mode every returned thumbnail is a fresh 1-second sample.
+                    // Samples inside the brightness settle window are skipped for the same
+                    // reason as above: the dim/wake transition itself scores as motion.
+                    if (motionAlerter != null && !settling) {
+                        motionAlerter.onSample(frameBuffer.getLastCandidateFile(), motionScore, nowMs);
+                    }
+
                     // Update the barcode strip with the new thumbnail.
                     updateBarcode(thumb);
 
@@ -1187,6 +1195,8 @@ public class CameraActivity extends AppCompatActivity {
                 Thread.currentThread().interrupt();
             }
         }
+
+        if (motionAlerter != null) motionAlerter.shutdown();
 
         if (headlineExecutor != null) {
             headlineExecutor.shutdownNow();
