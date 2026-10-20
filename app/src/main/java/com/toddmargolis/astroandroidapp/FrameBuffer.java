@@ -27,7 +27,8 @@ import java.util.Locale;
  *
  * Each mode uses one of two storage strategies:
  *   - RAM (useCompression=false): raw Bitmaps in an ArrayDeque, evicted by timestamp.
- *     Only used as a fallback; all current modes use disk storage.
+ *     Used by Moon: its 1.3s window is only ~10 frames, and holding them in RAM
+ *     eliminates the continuous JPEG encode+decode churn of the disk path.
  *   - Disk (useCompression=true): JPEG files in app-private external storage, one file
  *     per stored frame, evicted when older than mode.delaySeconds. Using getExternalFilesDir()
  *     instead of MediaStore avoids the media scanner, which caused multi-minute freezes

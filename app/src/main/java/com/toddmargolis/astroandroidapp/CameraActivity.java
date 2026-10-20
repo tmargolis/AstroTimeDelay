@@ -8,11 +8,15 @@ import android.graphics.Canvas;
 import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Rect;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CaptureRequest;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.util.Log;
+import android.util.Range;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -23,7 +27,10 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import androidx.annotation.NonNull;
+import androidx.annotation.OptIn;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.camera.camera2.interop.Camera2Interop;
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop;
 import androidx.camera.core.CameraSelector;
 import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.ImageProxy;
@@ -40,7 +47,6 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
@@ -132,19 +138,45 @@ public class CameraActivity extends AppCompatActivity {
     private final Runnable headlineScrollRunnable = new Runnable() {
         @Override public void run() {
             checkForLookbackDayRollover();
-            advanceHeadlineScroll();
-            timerHandler.postDelayed(this, HEADLINE_SCROLL_INTERVAL_MS);
+            // While dimmed the ticker pauses in place (scroll position is plain state, so
+            // it resumes exactly where it stopped) and this loop idles at a slow poll rate
+            // instead of 66 main-thread wakeups/sec — it still catches day rollovers and
+            // notices the wake transition within half a second.
+            if (!isDimmed) advanceHeadlineScroll();
+            timerHandler.postDelayed(this,
+                    isDimmed ? HEADLINE_SCROLL_DIMMED_INTERVAL_MS : HEADLINE_SCROLL_INTERVAL_MS);
         }
     };
 
     // -------------------------------------------------------------------------
     // Presence detection and screen dimming
+    //
+    // While dimmed, all rendering work is paused to save power — the delayed-frame
+    // decode+composite, the EMA display-bitmap conversion, barcode/label view posts,
+    // and the Proxima ticker scroll. The underlying state stays exactly current:
+    // frame storage, motion scoring, EMA float accumulation, and barcode drawing all
+    // continue, so resumeDisplayAfterDim() can restore every surface on wake to the
+    // same pixels it would show had the pause never happened.
     // -------------------------------------------------------------------------
     private long lastMovementTimeMs = System.currentTimeMillis();
-    private boolean isDimmed = false;
+    // Written on the camera thread (updateScreenBrightness); also read by main-thread
+    // runnables (updateTimeLabel, headlineScrollRunnable) to gate UI updates — volatile.
+    private volatile boolean isDimmed = false;
+    private boolean emaDisplayDirty = false; // EMA state advanced while dimmed; convert+post on wake
+    private Bitmap lastBarcodeDrawn;         // newest barcode double-buffer; re-posted on wake
     private static final long INACTIVITY_TIMEOUT_MS = 30000; // dim after 30 seconds of no motion
     private static final float BRIGHT_LEVEL = 1.0f;
     private static final float DIM_LEVEL = 0.05f;          // 5% brightness when inactive
+    // Changing the screen brightness changes what the front camera sees — the screen
+    // stops (or starts) illuminating the scene and auto-exposure compensates — which
+    // shows up as a global luma shift that crosses the motion threshold. Without a
+    // settle window the dim itself triggers a "motion" wake ~250ms later, and the
+    // screen never stays dim. Motion is ignored for this long after any transition.
+    private static final long BRIGHTNESS_SETTLE_MS = 2000;
+    private long lastBrightnessChangeMs = 0; // camera thread only (set via updateScreenBrightness)
+    // Ticker idle poll cadence while dimmed — just often enough to catch the day rollover
+    // and the wake transition without producing 66 main-thread wakeups per second.
+    private static final int HEADLINE_SCROLL_DIMMED_INTERVAL_MS = 500;
 
     // -------------------------------------------------------------------------
     // EMA ghost stack
@@ -193,10 +225,6 @@ public class CameraActivity extends AppCompatActivity {
     private int proximaLastKnownFileCount = 0;  // fileBuffer.size() when we last drew a barcode slit
     private int proximaLastKnownEmaCount = 0;   // fileBuffer.size() when the EMA ghost last updated
 
-    // Moon-mode barcode: legacy tile buffer (used when useCompression=false; retained for RAM-mode fallback)
-    private ArrayDeque<Bitmap> moonBarcodeBuffer;
-    private int maxMoonBarcodeFrames;
-    private Paint moonBarcodePaint;
     private int moonBarcodeSlitWidth; // fixed pixel width per Moon barcode frame; all slits equal-sized
 
     // -------------------------------------------------------------------------
@@ -380,12 +408,6 @@ public class CameraActivity extends AppCompatActivity {
         slitPixels = new int[barcodeH];
         rowAvgScratch = new int[miniW * barcodeH];
 
-        if (!mode.useCompression) {
-            maxMoonBarcodeFrames = (int)(mode.delaySeconds * mode.bufferFps) + 1;
-            moonBarcodeBuffer = new ArrayDeque<>();
-            moonBarcodePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
-        }
-
         FrameLayout.LayoutParams barcodeLp = (FrameLayout.LayoutParams) barcodeView.getLayoutParams();
         barcodeLp.width = barcodeW;
         barcodeLp.height = barcodeH;
@@ -514,12 +536,6 @@ public class CameraActivity extends AppCompatActivity {
         useBarcodeDisplay1 = true;
         barcodeView.setImageBitmap(barcodeDisplay1);
         mainView.setImageBitmap(null);
-        if (moonBarcodeBuffer != null) {
-            for (Bitmap b : moonBarcodeBuffer) {
-                if (b != null && !b.isRecycled()) b.recycle();
-            }
-            moonBarcodeBuffer.clear();
-        }
         updateLayoutForPhase(false);
         Toast.makeText(this, "Buffer cleared", Toast.LENGTH_SHORT).show();
         Log.d(TAG, "Buffer cleared by gesture");
@@ -538,9 +554,36 @@ public class CameraActivity extends AppCompatActivity {
         }
     }
 
+    /**
+     * Restores every display surface after a motion wake-up. While dimmed, frame storage,
+     * motion scoring, EMA accumulation, and barcode drawing all continued — only their
+     * screen output was skipped — so this just flushes the current state to the views:
+     *   - delayed frame: force the next analyzer tick to re-render immediately (the frame
+     *     itself is stateless — decoded fresh from the buffer head, which kept advancing)
+     *   - EMA ghost: convert the up-to-date float accumulator to pixels and post it
+     *   - barcode: post the newest offscreen double-buffer
+     *   - timestamp label / ticker: their main-thread timers self-resume within one tick
+     * Runs on the camera thread, same as the live EMA/barcode update paths.
+     */
+    private void resumeDisplayAfterDim() {
+        lastDisplayUpdateMs = 0;
+        if (emaDisplayDirty && stackInitialized) {
+            emaDisplayDirty = false;
+            Bitmap posted = useDisplay1 ? stackDisplay1 : stackDisplay2;
+            useDisplay1 = !useDisplay1;
+            buildDisplayBitmap(posted);
+            postEmaFrame(posted);
+        }
+        if (lastBarcodeDrawn != null) {
+            final Bitmap toPost = lastBarcodeDrawn;
+            runOnUiThread(() -> barcodeView.setImageBitmap(toPost));
+        }
+    }
+
     private void updateScreenBrightness(boolean shouldDim) {
         if (isDimmed == shouldDim) return;
         isDimmed = shouldDim;
+        lastBrightnessChangeMs = System.currentTimeMillis();
         runOnUiThread(() -> {
             WindowManager.LayoutParams lp = getWindow().getAttributes();
             lp.screenBrightness = shouldDim ? DIM_LEVEL : BRIGHT_LEVEL;
@@ -702,6 +745,11 @@ public class CameraActivity extends AppCompatActivity {
             isPlaybackPhase = nowPlayback;
             updateLayoutForPhase(isPlaybackPhase);
         }
+
+        // Skip label text updates while dimmed: setText() invalidates the view (10 UI
+        // frames/sec for an unreadable label at 5% brightness). The next 100ms tick
+        // after wake refreshes it. Phase transition + visibility logic above still runs.
+        if (isDimmed) return;
 
         if (!nowPlayback) {
             // Show countdown: how many seconds remain before the buffer is full.
@@ -880,12 +928,28 @@ public class CameraActivity extends AppCompatActivity {
         }, ContextCompat.getMainExecutor(this));
     }
 
+    @OptIn(markerClass = ExperimentalCamera2Interop.class)
     private void bindCamera() {
-        ImageAnalysis imageAnalysis = new ImageAnalysis.Builder()
+        ImageAnalysis.Builder analysisBuilder = new ImageAnalysis.Builder()
                 .setTargetResolution(new android.util.Size(mode.targetWidth, mode.targetHeight))
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                .build();
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888);
+
+        // Cap the sensor frame rate to the mode's targetFps. Without this the camera runs
+        // at the device default (~30fps) regardless of how few frames each mode actually
+        // stores, and the sensor/ISP power scales with fps — the largest constant drain
+        // after the screen. frameSkip (targetFps / bufferFps) assumes the camera really
+        // runs at targetFps, so this cap is also what makes the stored rate come out right.
+        Range<Integer> fpsRange = selectFpsRange(mode.targetFps);
+        if (fpsRange != null) {
+            new Camera2Interop.Extender<>(analysisBuilder)
+                    .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange);
+            Log.d(TAG, "Camera fps range capped to " + fpsRange + " (mode target " + mode.targetFps + ")");
+        } else {
+            Log.w(TAG, "No usable AE fps range found; camera runs at device default rate");
+        }
+
+        ImageAnalysis imageAnalysis = analysisBuilder.build();
 
         imageAnalysis.setAnalyzer(cameraExecutor, new ImageAnalysis.Analyzer() {
             @Override
@@ -895,7 +959,9 @@ public class CameraActivity extends AppCompatActivity {
                 // Throttle the display update to mode.displayIntervalMs (e.g. 250ms for Sun).
                 // Disk modes offload the decode + composite to displayExecutor so the camera
                 // thread isn't blocked waiting for JPEG I/O. RAM modes (Moon) composite inline.
-                if (isPlaybackPhase && nowMs - lastDisplayUpdateMs >= mode.displayIntervalMs) {
+                // Skipped entirely while dimmed — the delayed frame is stateless (decoded fresh
+                // from the buffer head), so resumeDisplayAfterDim() just forces the next render.
+                if (isPlaybackPhase && !isDimmed && nowMs - lastDisplayUpdateMs >= mode.displayIntervalMs) {
                     lastDisplayUpdateMs = nowMs;
                     if (mode.useCompression) {
                         displayExecutor.submit(() -> {
@@ -937,10 +1003,18 @@ public class CameraActivity extends AppCompatActivity {
                     // immediately; if no motion for INACTIVITY_TIMEOUT_MS, dim to save power.
                     boolean motionDetected = frameBuffer.isMotionDetected();
                     float motionScore = frameBuffer.getLastMotionScore();
-                    if (motionDetected) {
+                    // Ignore motion while auto-exposure settles after a brightness change —
+                    // the transition itself reads as motion (see BRIGHTNESS_SETTLE_MS).
+                    boolean settling = nowMs - lastBrightnessChangeMs < BRIGHTNESS_SETTLE_MS;
+                    if (motionDetected && settling) {
+                        Log.d(TAG, "Motion ignored during brightness settle: score="
+                                + String.format("%.3f", motionScore));
+                    } else if (motionDetected) {
                         Log.d(TAG, "Motion detected: score=" + String.format("%.3f", motionScore));
                         lastMovementTimeMs = nowMs;
+                        boolean wasDimmed = isDimmed;
                         updateScreenBrightness(false); // wake immediately on motion
+                        if (wasDimmed) resumeDisplayAfterDim();
                     } else if (!isDimmed && nowMs - lastMovementTimeMs > INACTIVITY_TIMEOUT_MS) {
                         updateScreenBrightness(true); // dim after inactivity timeout
                     }
@@ -993,6 +1067,9 @@ public class CameraActivity extends AppCompatActivity {
                         } else if (emaFrameCounter >= emaUpdateEvery) {
                             // Batch update: blend emaUpdateEvery frames worth of alpha in one step.
                             // See emaFade/emaAdd initialization in onCreate for the math.
+                            // The blend always runs — the accumulator must stay exact so the
+                            // ghost looks right on wake — but the display conversion + post is
+                            // skipped while dimmed (nothing is visible at 5% brightness).
                             emaFrameCounter = 0;
                             emaSourceThumb.getPixels(stackPixels, 0, miniW, 0, 0, miniW, miniH);
                             for (int i = 0; i < miniW * miniH; i++) {
@@ -1002,10 +1079,15 @@ public class CameraActivity extends AppCompatActivity {
                                 stackFloat[base + 1] = emaFade * stackFloat[base + 1] + emaAdd * powCurve[(p >> 8)  & 0xFF];
                                 stackFloat[base + 2] = emaFade * stackFloat[base + 2] + emaAdd * powCurve[ p        & 0xFF];
                             }
-                            Bitmap posted = useDisplay1 ? stackDisplay1 : stackDisplay2;
-                            useDisplay1 = !useDisplay1;
-                            buildDisplayBitmap(posted);
-                            postEmaFrame(posted);
+                            if (!isDimmed) {
+                                Bitmap posted = useDisplay1 ? stackDisplay1 : stackDisplay2;
+                                useDisplay1 = !useDisplay1;
+                                buildDisplayBitmap(posted);
+                                postEmaFrame(posted);
+                                emaDisplayDirty = false;
+                            } else {
+                                emaDisplayDirty = true;
+                            }
                         }
                     } // end !emaHistoryLoading
 
@@ -1024,6 +1106,59 @@ public class CameraActivity extends AppCompatActivity {
         } catch (Exception e) {
             Log.e(TAG, "Camera binding failed", e);
         }
+    }
+
+    /**
+     * Picks the front camera's best supported AE target fps range for the given cap.
+     *
+     * The sensor only supports the discrete ranges it advertises in
+     * CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES (requesting an unlisted range fails at
+     * session configuration), so the desired cap has to be matched against that list:
+     *   1. Prefer the range with the highest upper bound that is still <= desiredFps
+     *      (never exceed the cap when the hardware can honor it).
+     *   2. If every range exceeds desiredFps, take the one with the lowest upper bound
+     *      (closest achievable to the cap).
+     *   3. Ties are broken by the higher lower bound — a narrower range keeps the actual
+     *      frame rate pinned near the cap, so frameSkip yields a predictable stored fps
+     *      instead of drifting when auto-exposure slows the sensor in dim light.
+     *
+     * Returns null if the front camera or its fps ranges can't be queried; the caller
+     * then leaves the camera at its default rate rather than failing the session.
+     */
+    private Range<Integer> selectFpsRange(int desiredFps) {
+        try {
+            CameraManager manager = (CameraManager) getSystemService(CAMERA_SERVICE);
+            for (String id : manager.getCameraIdList()) {
+                CameraCharacteristics chars = manager.getCameraCharacteristics(id);
+                Integer facing = chars.get(CameraCharacteristics.LENS_FACING);
+                if (facing == null || facing != CameraCharacteristics.LENS_FACING_FRONT) continue;
+
+                Range<Integer>[] ranges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+                if (ranges == null || ranges.length == 0) return null;
+                Log.d(TAG, "Front camera AE fps ranges: " + Arrays.toString(ranges));
+
+                Range<Integer> best = null;
+                for (Range<Integer> r : ranges) {
+                    if (best == null) { best = r; continue; }
+                    boolean rWithinCap = r.getUpper() <= desiredFps;
+                    boolean bestWithinCap = best.getUpper() <= desiredFps;
+                    if (rWithinCap != bestWithinCap) {
+                        if (rWithinCap) best = r;               // rule 1 beats rule 2
+                    } else if (!r.getUpper().equals(best.getUpper())) {
+                        boolean rCloser = rWithinCap
+                                ? r.getUpper() > best.getUpper()  // within cap: higher is closer
+                                : r.getUpper() < best.getUpper(); // over cap: lower is closer
+                        if (rCloser) best = r;
+                    } else if (r.getLower() > best.getLower()) {
+                        best = r;                                 // rule 3: pin near the cap
+                    }
+                }
+                return best;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to query camera fps ranges", e);
+        }
+        return null;
     }
 
     @Override
@@ -1077,12 +1212,6 @@ public class CameraActivity extends AppCompatActivity {
         if (barcodeDisplay2 != null && !barcodeDisplay2.isRecycled()) barcodeDisplay2.recycle();
         barcodeDisplay1 = null;
         barcodeDisplay2 = null;
-        if (moonBarcodeBuffer != null) {
-            for (Bitmap b : moonBarcodeBuffer) {
-                if (b != null && !b.isRecycled()) b.recycle();
-            }
-            moonBarcodeBuffer.clear();
-        }
     }
 
     /**
@@ -1095,16 +1224,12 @@ public class CameraActivity extends AppCompatActivity {
      *
      * Routing:
      *   - Proxima Centauri: updateProximaBarcode() — 5-row year grid
-     *   - Moon (disk): time-proportional fixed-width thumbnail tiles (below)
-     *   - Moon (RAM fallback): updateMoonBarcode() — legacy tile buffer
+     *   - Moon: time-proportional fixed-width thumbnail tiles (below) — works identically
+     *     for RAM and disk storage since it only consumes the live thumbnail
      *   - Sun / Saturn: time-proportional single-pixel averaged-color slits (below)
      */
     private void updateBarcode(Bitmap thumb) {
         if (barcodeHistoryLoading) return;
-        if (!mode.useCompression) {
-            updateMoonBarcode(thumb);
-            return;
-        }
         if (mode.name.equals("Proxima Centauri")) {
             updateProximaBarcode();
             return;
@@ -1209,43 +1334,13 @@ public class CameraActivity extends AppCompatActivity {
             }
         }
 
-        final Bitmap toPost = writeBmp;
-        runOnUiThread(() -> barcodeView.setImageBitmap(toPost));
-    }
-
-    /**
-     * Moon-mode barcode: keep a rolling deque of thumbnail copies and redraw all frames
-     * as scaled tiles. Each of the maxMoonBarcodeFrames slots is a fixed-width column;
-     * oldest frame is at the left, newest at the right.
-     */
-    private void updateMoonBarcode(Bitmap thumb) {
-        Bitmap copy = thumb.copy(thumb.getConfig(), false);
-        moonBarcodeBuffer.addLast(copy);
-        while (moonBarcodeBuffer.size() > maxMoonBarcodeFrames) {
-            Bitmap old = moonBarcodeBuffer.pollFirst();
-            if (old != null && !old.isRecycled()) old.recycle();
+        // Always record the newest buffer so resumeDisplayAfterDim() can post it on wake;
+        // skip the view post (and its GPU texture upload) while the screen is dimmed.
+        lastBarcodeDrawn = writeBmp;
+        if (!isDimmed) {
+            final Bitmap toPost = writeBmp;
+            runOnUiThread(() -> barcodeView.setImageBitmap(toPost));
         }
-
-        Bitmap writeBmp = useBarcodeDisplay1 ? barcodeDisplay1 : barcodeDisplay2;
-        Canvas writeCanvas = useBarcodeDisplay1 ? barcodeCanvas1 : barcodeCanvas2;
-        useBarcodeDisplay1 = !useBarcodeDisplay1;
-
-        writeCanvas.drawColor(0xFF000000);
-
-        int slotW = barcodeW / maxMoonBarcodeFrames;
-        if (slotW < 1) slotW = 1;
-        int i = 0;
-        for (Bitmap frame : moonBarcodeBuffer) {
-            if (!frame.isRecycled()) {
-                int x = i * slotW;
-                int right = (i == maxMoonBarcodeFrames - 1) ? barcodeW : x + slotW;
-                writeCanvas.drawBitmap(frame, null, new Rect(x, 0, right, barcodeH), moonBarcodePaint);
-            }
-            i++;
-        }
-
-        final Bitmap toPost = writeBmp;
-        runOnUiThread(() -> barcodeView.setImageBitmap(toPost));
     }
 
     /**
@@ -1360,8 +1455,13 @@ public class CameraActivity extends AppCompatActivity {
         if (xPos >= 0 && xPos < barcodeW) {
             writeBmp.setPixels(slit24, 0, 1, xPos, rowTop, 1, rowH);
         }
-        final Bitmap toPost = writeBmp;
-        runOnUiThread(() -> barcodeView.setImageBitmap(toPost));
+        // Always record the newest buffer so resumeDisplayAfterDim() can post it on wake;
+        // skip the view post (and its GPU texture upload) while the screen is dimmed.
+        lastBarcodeDrawn = writeBmp;
+        if (!isDimmed) {
+            final Bitmap toPost = writeBmp;
+            runOnUiThread(() -> barcodeView.setImageBitmap(toPost));
+        }
     }
 
     /**

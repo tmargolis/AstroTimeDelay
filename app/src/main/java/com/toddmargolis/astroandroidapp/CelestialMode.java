@@ -57,7 +57,11 @@ public class CelestialMode {
     /**
      * When true, frames are compressed to JPEG and written to app-private external storage.
      * When false, raw Bitmap objects are kept in an ArrayDeque in RAM.
-     * All modes now use compression; the RAM path remains as a fallback.
+     * Moon uses the RAM path: its 1.3s window is only ~10 frames (~90MB of native bitmap
+     * memory), and holding them as Bitmaps eliminates a continuous ~7.5 JPEG encodes plus
+     * ~7.5 decodes per second at 1080p. The other modes buffer minutes-to-years of history
+     * and must use disk. Disk is also what makes a session survive an app restart — RAM
+     * mode starts fresh, which costs nothing when the whole delay is 1.3 seconds.
      */
     public boolean useCompression;
 
@@ -119,6 +123,8 @@ public class CelestialMode {
      *
      * bufferFps=8 keeps JPEG encode load manageable (~8 writes/sec) while still
      * capturing enough frames for a smooth 1.3-second buffer.
+     * targetFps=16 caps the camera sensor via Camera2Interop (see CameraActivity.bindCamera)
+     * to cut camera subsystem power; 16/8 = frameSkip 2 keeps the stored rate at 8 fps.
      * displayIntervalMs=125 = 8 fps display rate, matching bufferFps.
      * useAutoTint=true derives the tint from the moon overlay image colors.
      * emaAlpha=0.3 gives a responsive ghost that visibly reacts to motion over ~3 frames.
@@ -128,16 +134,16 @@ public class CelestialMode {
     public static CelestialMode createMoonMode() {
         CelestialMode m = new CelestialMode(
                 "Moon",
-                1.3f,                   // 384,400 km / 299,792 km/s
+                1.3f,               // 384,400 km / 299,792 km/s
                 R.drawable.moon_overlay,
                 1920, 1080,
-                30,                     // camera target fps
-                8,                      // store 1 frame per ~3-4 incoming (30/8 = frameSkip ~3)
-                0xFFD1D1D1,             // light grey (overridden by autoTint)
-                true,                   // derive tint from overlay image average color
-                true,                   // JPEG disk storage
-                125,                    // display update every 125ms = 8 fps
-                0.3f                    // fast-responding EMA — tuned 2.5× from baseline ~0.118
+                16,                    // camera target fps (capped in hardware via Camera2Interop)
+                8,                              // store 1 in 2 frames (16/8 = frameSkip 2)
+                0xFFD1D1D1,                     // light grey (overridden by autoTint)
+                true,                           // derive tint from overlay image average color
+                false,                          // RAM buffering — ~10 frames; no JPEG churn (see useCompression docs)
+                125,                            // display update every 125ms = 8 fps
+                0.3f                            // fast-responding EMA — tuned 2.5× from baseline ~0.118
         );
         m.barcodeHistorySeconds = 10.0f; // show 10s of history in the barcode strip
         return m;
@@ -146,12 +152,18 @@ public class CelestialMode {
     /**
      * Sun mode: 500-second delay (8 minutes 20 seconds, Sun–Earth light-travel time).
      *
-     * bufferFps=15 stores ~7,500 frames over 500 seconds at 1920×1080.
+     * bufferFps=4 stores ~2,000 frames over 500 seconds at 1920×1080, matching the 4 fps
+     * display rate — storing faster than the display consumes frames wastes JPEG encode
+     * power and flash writes on frames that are never shown.
+     * targetFps=16 caps the camera sensor via Camera2Interop (see CameraActivity.bindCamera)
+     * to cut camera subsystem power; 16/4 = frameSkip 4 keeps the stored rate at 4 fps.
      * displayIntervalMs=250 = 4 fps display; with a 500s delay the frame barely changes
      * second-to-second so high display rate would waste JPEG decode bandwidth.
      * tintColor 0xFFFFD54F is a warm amber yellow evoking sunlight.
-     * emaAlpha=0.0015 is very slow — at ~15 stored fps over 500s the buffer is ~7,500 deep,
+     * emaAlpha=0.006 is very slow — at 4 stored fps over 500s the buffer is ~2,000 deep,
      * so alpha must be tiny to keep older frames visible in the ghost.
+     * (ln(100)/2000 ≈ 0.0023 baseline × 2.5 tuning ≈ 0.006 — same formula and tuning
+     * factor as the previous 0.0015 value used at the old ~7,500-frame buffer depth.)
      */
     public static CelestialMode createSunMode() {
         return new CelestialMode(
@@ -159,13 +171,13 @@ public class CelestialMode {
                 500f,                   // 149.6M km / 299,792 km/s ≈ 499.7s
                 R.drawable.sun_overlay,
                 1920, 1080,
-                30,                     // camera target fps
-                15,                     // store 1 in 2 frames (30/15 = frameSkip 2)
+                16,                     // camera target fps (capped in hardware via Camera2Interop)
+                4,                      // store 1 in 4 frames (16/4 = frameSkip 4)
                 0xFFFFD54F,             // warm amber yellow — sunlight
                 false,                  // use manual tint color above
                 true,                   // JPEG disk storage
                 250,                    // display update every 250ms = 4 fps
-                0.0015f                 // very slow ghost — tuned 2.5× from baseline ~0.0006
+                0.006f                  // very slow ghost — tuned 2.5× from baseline ~0.0023
         );
     }
 
@@ -184,8 +196,9 @@ public class CelestialMode {
                 4740f,                  // ~1.28 billion km / 299,792 km/s ≈ 4,270s; padded to 4,740s (79 min)
                 R.drawable.saturn_placeholder,
                 1280, 720,
-                24,                     // camera target fps
-                1,                      // store 1 frame per second (24/1 = frameSkip 24)
+                15,                     // camera target fps — Tab A9+ front camera pins at [15,15]
+                                        // (no lower fixed range); 15/1 = frameSkip 15 keeps 1 fps stored
+                1,                      // store 1 frame per second (15/1 = frameSkip 15)
                 0xFFD2691E,             // chocolate/rust — Saturn's atmosphere
                 false,                  // use manual tint color above
                 true,                   // JPEG disk storage
@@ -213,7 +226,8 @@ public class CelestialMode {
                 133_848_480f,                       // 4.24 years × 365.25 × 24 × 3600 s
                 R.drawable.proxima_centauri_milky_way,
                 1280, 720,
-                24,                                 // camera target fps (used for motion sampling)
+                15,                                 // camera target fps — pins at [15,15] on the Tab A9+;
+                                                    // sampling is time-based (1/sec) so only power is affected
                 1,                                  // bufferFps — overridden by storageIntervalMs
                 0xFFE0FFFF,                         // pale blue-white — infrared/starlight
                 false,                              // use manual tint color above
