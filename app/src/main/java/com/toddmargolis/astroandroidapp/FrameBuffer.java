@@ -35,8 +35,9 @@ import java.util.Locale;
  *     when thousands of buffer files triggered a scanner backlog at mode transitions.
  *
  * Proxima Centauri is a special case: storageIntervalMs > 0 activates a separate path
- * (handleProximaFrame) that samples at 1fps, scores each second for motion, and promotes
- * only the highest-motion frame from each 4-hour window to a permanent file.
+ * (handleProximaFrame) that samples at 1fps, grades each sample for how much new, sharp
+ * detail it shows against a model of the empty scene (gradeProximaSample), and promotes
+ * only the highest-graded frame from each 4-hour window to a permanent file.
  *
  * Session persistence: on construction, any existing session directory for the current
  * mode is found and its files are reloaded into the buffer, so the delay continues across
@@ -144,6 +145,25 @@ public class FrameBuffer {
     private File proximaCandidatesDir = null; // sessionDir/candidates/ — temp files for current window
     private volatile File lastPromotedFile = null; // winner file from the most recent selectBestProximaFrame()
     private volatile File lastCandidateFile = null; // candidate JPEG written by the most recent sample (null if the write failed)
+
+    // -------------------------------------------------------------------------
+    // Proxima Centauri: promotion grader (see gradeProximaSample()).
+    // Separate from the frame-to-frame motion score, which still drives screen wake and
+    // motion alerts. The motion score peaks on the frame *after* a change (lights switched,
+    // someone just left), so ranking by it promoted mostly empty or mid-transition frames.
+    // -------------------------------------------------------------------------
+    private static final float GRADE_BACKGROUND_ALPHA = 0.02f;   // ~50 s background time constant at 1 sample/s
+    private static final float GRADE_SCENE_CUT_FRACTION = 0.5f;  // more than half the frame changed → lighting/scene change
+    private static final float GRADE_MIN_MEAN_LUMA = 30f;        // darker frames (night, covered lens) grade 0; gain would amplify noise
+    private static final int GRADE_EDGE_DELTA = 2 * LUMA_DELTA_THRESHOLD;
+    private static final float GRADE_STATIC_CHANGE_FRACTION = 0.02f;
+    private static final int GRADE_STATIC_ABSORB_SAMPLES = 10;   // a motionless change this long (moved object, open door) joins the background
+    private static final int GRADE_MIN_CHANGED_PIXELS = 50;
+    private float[] gradeBackground;      // slow-moving luma model of the empty scene; null until the first sample
+    private float[] gradeLuma;            // scratch: current sample's luma
+    private int[] gradePixels;            // scratch: current sample's ARGB pixels
+    private int gradeStaticSamples = 0;
+    private long gradeSuppressedUntilMs = 0; // camera thread only; see suppressGradingUntil()
 
     // -------------------------------------------------------------------------
     // Session persistence
@@ -354,7 +374,7 @@ public class FrameBuffer {
     /**
      * Parses the capture timestamp from a JPEG filename.
      * Handles both plain frames ("yyyy.MM.dd.HH.mm.ss.SSS.jpg") and
-     * Proxima winner frames ("yyyy.MM.dd.HH.mm.ss.SSS_m=X.XXXXX.jpg").
+     * Proxima winner frames ("yyyy.MM.dd.HH.mm.ss.SSS_m=X.XXXXX[_g=X.XXXXX].jpg").
      * Returns 0 if the name cannot be parsed (file is skipped during restore).
      */
     private long extractTimestampFromFile(File file) {
@@ -400,6 +420,16 @@ public class FrameBuffer {
      */
     public File getLastCandidateFile() {
         return lastCandidateFile;
+    }
+
+    /**
+     * Pauses Proxima promotion grading until untilMs. Called on the camera thread when the
+     * screen dims or wakes: the screen lights the room, and auto-exposure takes a moment to
+     * settle, so those samples would otherwise grade as new detail. While suppressed, the
+     * background model tracks each sample so grading resumes against the new lighting.
+     */
+    public void suppressGradingUntil(long untilMs) {
+        gradeSuppressedUntilMs = untilMs;
     }
 
     /** EMA blending coefficient, passed through from CelestialMode for the ghost stack init. */
@@ -632,13 +662,16 @@ public class FrameBuffer {
             lastStoredThumb = thumb.copy(thumb.getConfig(), false);
         }
 
-        // Write candidate to candidates/ dir with score embedded in the filename
+        float grade = gradeProximaSample(thumb, score, nowMs);
+
+        // Write candidate to candidates/ dir with both scores embedded in the filename
         if (proximaCandidatesDir != null) {
-            File candidate = writeProximaCandidate(bitmap, nowMs, score);
+            File candidate = writeProximaCandidate(bitmap, nowMs, score, grade);
             lastCandidateFile = candidate;
             if (candidate != null) {
                 proximaCandidates.add(candidate);
                 Log.d(TAG, "Proxima sample: score=" + String.format(Locale.US, "%.5f", score)
+                        + "  grade=" + String.format(Locale.US, "%.5f", grade)
                         + "  candidates=" + proximaCandidates.size()
                         + "  file=" + candidate.getName());
             }
@@ -658,12 +691,124 @@ public class FrameBuffer {
     }
 
     /**
-     * Writes bitmap as JPEG to candidates/ with timestamp and motion score in the filename.
-     * Filename format: yyyy.MM.dd.HH.mm.ss.SSS_m=X.XXXXX.jpg
+     * Grades one Proxima sample for promotion: how much new, sharp detail it shows compared
+     * with a slowly updated model of the empty scene. Returns 0 for samples that should never
+     * win (too dark, lighting/scene changes, brightness-settle windows).
+     *
+     * Per sample, on the thumbnail (camera thread, ~3–5× the cost of calculateMotionScore):
+     *   1. Normalize overall brightness to the background's, so lights dimming or the
+     *      screen waking don't read as change.
+     *   2. Count pixels whose luma differs from the background, and pixels whose edge
+     *      strength (gradient) differs — a person adds edges; a lighting shift mostly doesn't.
+     *   3. Measure sharpness as the Laplacian variance over the changed pixels, so a crisp
+     *      frame of someone beats a motion-blurred one.
+     *   grade = edgeChangedFraction × sqrt(sharpness)
+     *
+     * Background upkeep: blended toward each sample with GRADE_BACKGROUND_ALPHA (a person
+     * scores for as long as they're in view, and the empty frame after they leave scores
+     * near 0); snapped to the sample on a scene cut, during brightness suppression, or after
+     * GRADE_STATIC_ABSORB_SAMPLES motionless samples of a lasting change.
+     *
+     * Validated by replaying a 2-hour candidates/ window: it promoted a sharp frame of a
+     * person walking in, where the motion score picked a blurred close-up — and, across the
+     * prior month, mostly empty hallways and self-lit night frames.
      */
-    private File writeProximaCandidate(Bitmap bitmap, long captureMs, float score) {
+    private float gradeProximaSample(Bitmap thumb, float motionScore, long nowMs) {
+        int w = thumbW, h = thumbH, n = w * h;
+        if (gradePixels == null) {
+            gradePixels = new int[n];
+            gradeLuma = new float[n];
+        }
+        thumb.getPixels(gradePixels, 0, w, 0, 0, w, h);
+        float[] cur = gradeLuma;
+        double sumCur = 0;
+        for (int i = 0; i < n; i++) {
+            int p = gradePixels[i];
+            float l = (((p >> 16) & 0xFF) * 77 + ((p >> 8) & 0xFF) * 150 + (p & 0xFF) * 29) >> 8;
+            cur[i] = l;
+            sumCur += l;
+        }
+
+        if (gradeBackground == null) {
+            gradeBackground = cur.clone();
+            return 0f;
+        }
+        float[] bg = gradeBackground;
+        if (nowMs < gradeSuppressedUntilMs) {
+            System.arraycopy(cur, 0, bg, 0, n);
+            gradeStaticSamples = 0;
+            return 0f;
+        }
+
+        double sumBg = 0;
+        for (int i = 0; i < n; i++) sumBg += bg[i];
+        float meanCur = (float) (sumCur / n);
+        float meanBg = (float) (sumBg / n);
+
+        float grade = 0f;
+        if (meanCur >= GRADE_MIN_MEAN_LUMA) {
+            float gain = Math.max(0.25f, Math.min(4f, meanBg / meanCur));
+            int changed = 0, edgeChanged = 0, lapCount = 0;
+            double lapSum = 0, lapSumSq = 0;
+            for (int y = 1; y < h - 1; y++) {
+                int row = y * w;
+                for (int x = 1; x < w - 1; x++) {
+                    int i = row + x;
+                    float c  = Math.min(255f, cur[i] * gain);
+                    float cl = Math.min(255f, cur[i - 1] * gain);
+                    float cr = Math.min(255f, cur[i + 1] * gain);
+                    float cu = Math.min(255f, cur[i - w] * gain);
+                    float cd = Math.min(255f, cur[i + w] * gain);
+                    float edgeCur = Math.abs(cr - cl) + Math.abs(cd - cu);
+                    float edgeBg = Math.abs(bg[i + 1] - bg[i - 1]) + Math.abs(bg[i + w] - bg[i - w]);
+                    if (Math.abs(edgeCur - edgeBg) >= GRADE_EDGE_DELTA) edgeChanged++;
+                    if (Math.abs(c - bg[i]) >= LUMA_DELTA_THRESHOLD) {
+                        changed++;
+                        float lap = cl + cr + cu + cd - 4f * c;
+                        lapSum += lap;
+                        lapSumSq += lap * lap;
+                        lapCount++;
+                    }
+                }
+            }
+            float interior = (float) ((w - 2) * (h - 2));
+            float changedFraction = changed / interior;
+
+            if (changedFraction >= GRADE_SCENE_CUT_FRACTION) {
+                System.arraycopy(cur, 0, bg, 0, n);
+                gradeStaticSamples = 0;
+                return 0f;
+            }
+            if (lapCount >= GRADE_MIN_CHANGED_PIXELS) {
+                double lapMean = lapSum / lapCount;
+                double sharpness = lapSumSq / lapCount - lapMean * lapMean;
+                grade = (edgeChanged / interior) * (float) Math.sqrt(Math.max(0, sharpness));
+            }
+
+            if (motionScore < MOTION_FRACTION_THRESHOLD && changedFraction > GRADE_STATIC_CHANGE_FRACTION) {
+                gradeStaticSamples++;
+            } else {
+                gradeStaticSamples = 0;
+            }
+            if (gradeStaticSamples >= GRADE_STATIC_ABSORB_SAMPLES) {
+                System.arraycopy(cur, 0, bg, 0, n);
+                gradeStaticSamples = 0;
+                return grade;
+            }
+        }
+
+        for (int i = 0; i < n; i++) bg[i] += GRADE_BACKGROUND_ALPHA * (cur[i] - bg[i]);
+        return grade;
+    }
+
+    /**
+     * Writes bitmap as JPEG to candidates/ with timestamp, motion score, and promotion grade
+     * in the filename. Filename format: yyyy.MM.dd.HH.mm.ss.SSS_m=X.XXXXX_g=X.XXXXX.jpg
+     */
+    private File writeProximaCandidate(Bitmap bitmap, long captureMs, float score, float grade) {
         String timestamp = FILE_FMT.format(new Date(captureMs));
-        String filename = timestamp + "_m=" + String.format(Locale.US, "%.5f", score) + ".jpg";
+        String filename = timestamp + "_m=" + String.format(Locale.US, "%.5f", score)
+                + "_g=" + String.format(Locale.US, "%.5f", grade) + ".jpg";
         File file = new File(proximaCandidatesDir, filename);
         try (FileOutputStream fos = new FileOutputStream(file)) {
             bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, fos);
@@ -685,19 +830,31 @@ public class FrameBuffer {
             return;
         }
 
-        // Find the candidate with the highest motion score
-        File winner = null;
-        float bestScore = -1f;
+        // Pick the highest promotion grade (_g=). Candidates restored from before the grader
+        // existed carry only _m=; if no candidate has a grade, fall back to the motion score.
+        // If nothing graded above 0 (an empty or dark window), keep the window's middle frame
+        // rather than whichever sample a lighting flicker happened to favor.
+        boolean anyGraded = false;
         for (File candidate : proximaCandidates) {
-            float score = extractScoreFromFilename(candidate.getName());
+            if (!Float.isNaN(extractFilenameValue(candidate.getName(), "_g="))) {
+                anyGraded = true;
+                break;
+            }
+        }
+        String key = anyGraded ? "_g=" : "_m=";
+        File winner = null;
+        float bestScore = 0f;
+        for (File candidate : proximaCandidates) {
+            float score = extractFilenameValue(candidate.getName(), key);
             if (score > bestScore) {
                 bestScore = score;
                 winner = candidate;
             }
         }
+        if (winner == null) winner = proximaCandidates.get(proximaCandidates.size() / 2);
 
-        Log.d(TAG, "Proxima window ended: winner=" + (winner != null ? winner.getName() : "none")
-                + "  score=" + String.format(Locale.US, "%.5f", bestScore)
+        Log.d(TAG, "Proxima window ended: winner=" + winner.getName()
+                + "  " + key + String.format(Locale.US, "%.5f", bestScore)
                 + "  from " + proximaCandidates.size() + " candidates");
 
         // Move winner from candidates/ to sessionDir/
@@ -740,18 +897,19 @@ public class FrameBuffer {
     }
 
     /**
-     * Parses the _m=X.XXXXX motion score from a Proxima candidate or winner filename.
-     * Returns 0f if the suffix is absent (e.g. legacy files without a score).
+     * Parses a "_m=X.XXXXX" (motion score) or "_g=X.XXXXX" (promotion grade) value from a
+     * Proxima candidate or winner filename. Returns NaN if the key is absent or unparseable.
      */
-    private float extractScoreFromFilename(String name) {
-        int idx = name.indexOf("_m=");
-        if (idx < 0) return 0f;
+    private float extractFilenameValue(String name, String key) {
+        int idx = name.indexOf(key);
+        if (idx < 0) return Float.NaN;
+        int start = idx + key.length();
+        int end = name.indexOf('_', start);
+        if (end < 0) end = name.endsWith(".jpg") ? name.length() - 4 : name.length();
         try {
-            String scoreStr = name.substring(idx + 3); // e.g. "0.04712.jpg"
-            if (scoreStr.endsWith(".jpg")) scoreStr = scoreStr.substring(0, scoreStr.length() - 4);
-            return Float.parseFloat(scoreStr);
+            return Float.parseFloat(name.substring(start, end));
         } catch (NumberFormatException e) {
-            return 0f;
+            return Float.NaN;
         }
     }
 
@@ -1072,6 +1230,8 @@ public class FrameBuffer {
         lastProximaSampleMs = 0;
         proximaWindowStartMs = 0;
         proximaCandidates.clear();
+        gradeBackground = null;
+        gradeStaticSamples = 0;
         Log.d(TAG, "FrameBuffer cleared");
     }
 

@@ -211,8 +211,8 @@ public class CelestialMode {
      * Proxima Centauri mode (Collector's Edition): 4.24-year delay.
      *
      * storageIntervalMs overrides the normal frameSkip mechanism entirely — FrameBuffer
-     * delegates to handleProximaFrame() which samples at 1fps, scores each second for
-     * motion, and keeps only the highest-motion frame from each 4-hour window.
+     * delegates to handleProximaFrame() which samples at 1fps, grades each second against
+     * a model of the empty scene, and keeps only the highest-graded frame from each 4-hour window.
      * bufferFps=1 is declared but effectively unused (storageIntervalMs takes precedence).
      * displayIntervalMs=60_000 = one display update per minute; with a 4+ year delay,
      * more frequent updates would be meaningless and waste battery.

@@ -51,7 +51,7 @@ Frame retention on the device is determined by each mode's delay window:
 | Moon | Frames older than 1.3 seconds are evicted immediately as new frames arrive |
 | Sun | Frames older than 8 minutes 20 seconds are deleted from disk as new frames arrive |
 | Saturn | Frames older than 79 minutes are deleted from disk as new frames arrive |
-| Proxima Centauri | Candidate frames from each 4-hour window are deleted at window end; only the single highest-motion winner is kept |
+| Proxima Centauri | Candidate frames from each 4-hour window are deleted at window end; only the single highest-graded winner is kept |
 
 For Moon, Sun, and Saturn, the rolling buffer means that at any moment the device holds only as much video as the delay requires — not a growing archive. For Proxima Centauri, which stores one representative frame per four-hour window, the total accumulation grows very slowly (a few megabytes per day) and consists of single still images rather than continuous video.
 

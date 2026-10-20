@@ -82,14 +82,18 @@ Sessions survive app restarts: on launch, the most recent session directory for 
 
 ### Proxima Centauri: Motion-Based Frame Selection
 
-Because a 4.24-year delay cannot be accumulated on a single device, Proxima mode stores one frame per four-hour window. Rather than capturing an arbitrary frame, the system runs continuous motion detection at 1 fps and selects the frame with the highest change score within the window.
+Because a 4.24-year delay cannot be accumulated on a single device, Proxima mode stores one frame per four-hour window. Rather than capturing an arbitrary frame, the system grades every second of the window and keeps the frame showing the most new, sharp detail compared with the empty scene — usually a person in view.
 
 **Algorithm:**
 1. Sample one frame per second (1fps gate inside `handleProximaFrame()`).
-2. Each sample is compared against the previous second's thumbnail using luma-delta motion scoring (`calculateMotionScore()`). The score is the fraction of pixels whose luma changed by more than a threshold.
-3. Candidate frames are written to a `candidates/` subdirectory with the motion score embedded in the filename: `yyyy.MM.dd.HH.mm.ss.SSS_m=X.XXXXX.jpg`.
-4. At the end of each four-hour window, `selectBestProximaFrame()` scans all candidate filenames, identifies the highest score, moves the winner to the session directory as a permanent frame, and deletes all losers.
-5. Permanent winner filenames retain the `_m=` score suffix so motion level is visible on disk.
+2. Each sample gets two scores, computed on its thumbnail:
+   - **Motion score `m`** (`calculateMotionScore()`): the fraction of pixels whose luma changed by more than a threshold since the previous second. It drives screen wake/dim and motion alerts.
+   - **Promotion grade `g`** (`gradeProximaSample()`): compares the sample with a slowly updated background model of the empty scene (~50 s time constant). After normalizing overall brightness, it measures the fraction of pixels whose edge strength differs from the background, multiplied by the square root of the sharpness (Laplacian variance) of the changed pixels. Frames that are too dark, lighting or scene changes (more than half the frame changed), and the two seconds after the screen dims or wakes grade 0. A change that stays motionless for 10 seconds (a moved object, an open door) is absorbed into the background.
+3. Candidate frames are written to a `candidates/` subdirectory with both scores embedded in the filename: `yyyy.MM.dd.HH.mm.ss.SSS_m=X.XXXXX_g=X.XXXXX.jpg`.
+4. At the end of each four-hour window, `selectBestProximaFrame()` scans all candidate filenames, picks the highest grade, moves the winner to the session directory as a permanent frame, and deletes all losers. If no candidate graded above 0 (an empty or dark window), the window's middle frame is kept.
+5. Permanent winner filenames retain the `_m=` and `_g=` suffixes so both scores are visible on disk.
+
+Why not rank by the motion score? It peaks on the frame *after* a change — lights switching, someone having just left, the screen lighting the room at night — so ranking by it mostly promoted empty or mid-transition frames.
 
 If the app is force-closed mid-window, existing candidates are reloaded from `candidates/` on relaunch and the window continues accumulating.
 

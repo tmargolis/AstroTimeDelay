@@ -585,6 +585,7 @@ public class CameraActivity extends AppCompatActivity {
         if (isDimmed == shouldDim) return;
         isDimmed = shouldDim;
         lastBrightnessChangeMs = System.currentTimeMillis();
+        frameBuffer.suppressGradingUntil(lastBrightnessChangeMs + BRIGHTNESS_SETTLE_MS);
         runOnUiThread(() -> {
             WindowManager.LayoutParams lp = getWindow().getAttributes();
             lp.screenBrightness = shouldDim ? DIM_LEVEL : BRIGHT_LEVEL;
